@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(py -m py_compile \"c:\\\\Users\\\\melib\\\\OneDrive\\\\Escritorio\\\\TESIS\\\\Raspberry\\\\EMG\\\\emg_multicdc_gui.py\")",
+      "PowerShell(if \\($?\\) { \"OK: sin errores de sintaxis\" })",
+      "PowerShell(if \\($?\\) { \"OK sintaxis\" })"
+    ]
+  }
+}
