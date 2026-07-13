@@ -3,7 +3,14 @@
 Firmware para un sistema de adquisición de señales EMG (electromiografía) multicanal, basado en
 una Raspberry Pi Pico (RP2040) conectada a un ADC frontal analógico ADS1298 (Texas Instruments)
 por SPI, y expuesto a una PC mediante múltiples interfaces USB CDC (TinyUSB). Incluye además una
-GUI en Python (`emg_multicdc_gui.py`) para monitorear/enviar datos por cada CDC.
+GUI en Python (`emg_multicdc_gui.py`) pensada para uso clínico: conexión de un solo botón (sin
+exponer CDC ni puertos COM), sidebar de canales/filtros/RLD-lead-off y grilla de plots en tiempo
+real, con el detalle de debug (mapeo manual de puertos, texto crudo, configuración granular) en
+una pestaña "Avanzado" aparte.
+
+> Guía paso a paso para dejar el proyecto andando desde cero (SDK de Pico, compilar/flashear el
+> firmware, dependencias de Python y cómo correr la GUI) en [`README.md`](README.md). Este
+> `CLAUDE.md` es la referencia técnica; el `README.md` es la guía de instalación/uso.
 
 > **Instrucción de mantenimiento:** este archivo debe mantenerse actualizado. Cada vez que se haga
 > un cambio relevante en el proyecto (firmware, `emg_multicdc_gui.py`, estructura de archivos,
@@ -21,11 +28,13 @@ Implementado:
 - Banner de bienvenida por cada CDC al conectar (DTR→1) con el nombre de la interfaz entre
   paréntesis (p. ej. `"DATA STREAM CH1-CH2 (CDC2)"`), usado también para identificación automática
   de puertos desde la GUI de Python (ver más abajo).
-- GUI de monitoreo en Python (`emg_multicdc_gui.py`, PyQt6 + pyserial + pyqtgraph + numpy) con
-  auto-detección de qué puerto COM corresponde a cada CDC, panel de texto para CDC0/CDC1, **plots en
-  tiempo real** de los 8 canales EMG (CDC2-5) y **panel de estado de lead-off/RLD** (CDC6), más una
-  **pestaña de configuración** con controles para toda la API de CDC1. Ver sección "Herramienta PC"
-  más abajo para el detalle completo.
+- GUI clínica en Python (`emg_multicdc_gui.py`, PyQt6 + pyserial + pyqtgraph + numpy + scipy), con
+  3 pestañas: **"Monitor"** (sidebar de canales/ganancia/filtros/RLD-lead-off al 20% + grilla de
+  plots en tiempo real al 80%, conexión de un solo botón), **"Señales de prueba"** (test signal
+  interna simplificada) y **"Avanzado"** (todo el detalle de debug: mapeo manual de puertos por
+  CDC, texto crudo de CDC0/CDC1, estado completo de lead-off/RLD y tabla granular de configuración).
+  Filtros notch/pasaaltos/pasabajos implementados en software (scipy.signal), no en firmware. Ver
+  sección "Herramienta PC" más abajo para el detalle completo.
 - **Streaming continuo multicore** de los 8 canales EMG + estado de lead-off por USB, y una **API de
   configuración completa** por CDC1 (ganancia, encendido de canales, modo HR/LP, RLD, test signals,
   mux de entrada, lead-off detection). Ver sección "Arquitectura de adquisición y streaming" más
@@ -286,62 +295,91 @@ Cada CDC tiene su propio endpoint de notificación, IN y OUT (ver `usb_descripto
 
 ## Herramienta PC: `emg_multicdc_gui.py`
 
-GUI de escritorio (PyQt6 + pyserial + pyqtgraph + numpy) para monitorear, visualizar en tiempo real
-y configurar los 7 CDC del firmware desde la PC.
-Requisitos: `pip install pyqt6 pyserial pyqtgraph numpy`. Uso: `python emg_multicdc_gui.py`. El plan
-de diseño de este cambio (visualización binaria + panel de configuración) quedó guardado en
-`docs/plan_gui_streaming_config.md`.
+GUI de escritorio (PyQt6 + pyserial + pyqtgraph + numpy + scipy) pensada para uso clínico:
+conexión de un solo botón, sidebar de canales/filtros/RLD-lead-off y grilla de plots en tiempo
+real, dejando todo el detalle de CDC/puertos/debug en una pestaña "Avanzado" separada.
+Requisitos: `pip install pyqt6 pyserial pyqtgraph numpy scipy`. Uso: `python emg_multicdc_gui.py`.
+El plan de diseño original (streaming binario + panel de configuración) quedó en
+`docs/plan_gui_streaming_config.md`; el rediseño clínico (sidebar, pestañas, filtros software) se
+decidió en sesión, sin un plan_*.md dedicado (ver este mismo `CLAUDE.md` para el detalle vigente).
 
 ### Qué hace
 
-- Ventana con pestañas (`QTabWidget`): **"Monitor"** y **"Configuración"** (`ConfigPanel`, en
-  `QScrollArea`, con los controles que arman y mandan los comandos de la API de CDC1). El bloque
-  superior (selección de puertos, baudrate, botones de conectar/detectar, pantalla completa) es
-  común a ambas pestañas.
-- La ventana arranca maximizada (`showMaximized()`); botón **"Pantalla completa (F11)"** (o tecla
-  `F11`) alterna `showFullScreen()`/`showNormal()` vía `MainWindow.toggle_fullscreen()`.
-- Pestaña **"Monitor"** (envuelta en `QScrollArea` para poder scrollear si no entra todo en
-  pantalla):
-  - Fila superior compacta con `CdcPanel` de **CDC0**/**CDC1** (texto por línea, estado de conexión,
-    input + botones enviar/limpiar) y `RldStatusPanel` de **CDC6** (8 indicadores para
-    `LOFF_STATP` + 8 para `LOFF_STATN`, verde = electrodo OK / rojo = desconectado).
-  - Caja **"Canales visibles"**: un checkbox por canal físico (1-8), todos tildados por defecto.
-  - Grilla de plots (`SingleChannelPlot`, uno por canal físico, no por CDC): `channel_grid_container`
-    ocupa todo el espacio restante (`stretch=1`) y se reparte dinámicamente entre los canales
-    tildados vía `MainWindow._rebuild_channel_grid()` + `best_grid_shape(n)` — 1 canal tildado ocupa
-    toda el área, 4 canales la dividen 2×2, 8 canales 2×4, etc. (elige la forma sin huecos y más
-    cuadrada, prefiriendo más columnas que filas en empate). Los 8 `SingleChannelPlot` **siempre**
-    existen y siguen recibiendo datos (`append_batch`) aunque estén ocultos — destildar un canal
-    solo lo saca del grid (`layout.takeAt` + `hide()`) y lo excluye de `refresh_plots()`, no corta el
-    streaming; al volver a tildarlo se re-inserta con los datos ya bufferizados.
-  - Cada `SingleChannelPlot` tiene el eje Y en **mV** con autoescala (`enableAutoRange(axis="y")` de
-    pyqtgraph) para acomodarse automáticamente a la amplitud real de cada señal; se desactiva sola si
-    el usuario hace zoom/pan manual sobre ese plot.
-  - `MainWindow.pair_channels` mapea cada nombre de CDC de datos a su par de canales físicos
-    (`{"DATA CH1-CH2 CDC2": (1, 2), ...}`), usado para rutear los batches de `poll_process_queues` y
-    los cambios de estado de conexión (`_update_connection_status`) al `SingleChannelPlot` de cada
-    canal individual.
-- **`ConfigPanel`** (pestaña "Configuración"): tabla por canal (1-8) con combos/checkboxes para
-  `GAIN`, `CHPOWER`, `MUX`, `LOFF_CH` (P/N), `RLD_CH` (P/N); controles globales para `MODE`, `RLD`,
-  `TESTSIG`/`TESTSIG_AMP`/`TESTSIG_FREQ`, `LOFF_MODE`/`LOFF_TYPE`/`LOFF_CURRENT`/`LOFF_THRESHOLD`, y
-  botones `START`/`STOP`. Cada control manda su comando por CDC1 apenas cambia (sin botón
-  "aplicar"); las respuestas (`OK`/`ERROR: ...`) se ven en el panel de texto de CDC1 en "Monitor".
-  `RREG`/`WREG` crudos se siguen escribiendo a mano ahí (no tienen controles dedicados). El combo de
-  `GAIN` de cada canal además emite `ConfigPanel.gain_changed(canal, ganancia)`, que
-  `MainWindow.on_gain_changed()` propaga al `SingleChannelPlot` de ese canal para que la conversión
-  a mV use la ganancia real configurada.
-- Un combo de asignación de puerto COM por CDC + spinbox de baudrate + botones "Buscar puertos",
-  "Auto-detectar CDC", "Conectar seleccionados" y "Desconectar todo" (sin cambios de comportamiento).
+- Ventana con 3 pestañas (`QTabWidget`): **"Monitor"**, **"Señales de prueba"** y **"Avanzado"**.
+  Barra superior común a las 3: botones **"Conectar equipo"**/**"Desconectar equipo"**, un label de
+  estado agregado (verde = las 7 interfaces conectadas, ámbar = parcial, rojo = ninguna) y
+  **"Pantalla completa (F11)"** (`MainWindow.toggle_fullscreen()`). La ventana arranca maximizada.
+- **"Monitor"** (pestaña principal, uso clínico): `QSplitter` horizontal con la sidebar a la
+  izquierda (~20% del ancho, `setStretchFactor(0, 1)` vs `(1, 4)`) y la grilla de plots a la
+  derecha (~80%):
+  - Sidebar (`MainWindow._build_sidebar()`):
+    - **"Canales"**: checkbox de visibilidad + combo de ganancia (`GAIN_VALUES`) por cada canal
+      físico (1-8). El checkbox reusa `_rebuild_channel_grid()`/`best_grid_shape(n)` — 1 canal
+      tildado ocupa toda el área, 4 canales la dividen 2×2, 8 canales 2×4, etc. Los 8
+      `SingleChannelPlot` **siempre** existen y reciben datos (`append_batch`) aunque estén
+      ocultos; destildar solo los saca del grid y de `refresh_plots()`. El combo de ganancia manda
+      `GAIN <ch> <valor>` (`_on_sidebar_gain_changed`) y se mantiene sincronizado con el combo
+      equivalente de `ConfigPanel` en "Avanzado" en ambos sentidos (incluida una relectura real de
+      configuración al conectar, ver más abajo).
+    - **"Filtros (canales visibles)"**: 3 combos — Notch (Apagado/50 Hz/60 Hz), Pasaaltos
+      (Apagado/20 Hz/50 Hz), Pasabajos (Apagado/150 Hz/500 Hz). Ver "Filtros de señal" más abajo.
+    - **"RLD / Lead-off"**: dos checkboxes ON/OFF simples. RLD manda `RLD ON`/`RLD OFF`. Lead-off
+      manda `LOFF_CH <ch> P/N 1` (ON) o `0` (OFF) para los 8 canales de una vez, usando los
+      parámetros finos (`LOFF_MODE`/`LOFF_TYPE`/`LOFF_CURRENT`/`LOFF_THRESHOLD`) que estén
+      configurados en "Avanzado".
+  - Grilla de plots: igual que antes (`SingleChannelPlot`, eje Y en mV con autoescala,
+    `MainWindow.pair_channels` rutea los batches de `poll_process_queues`).
+- **"Señales de prueba"** (`TestSignalPanel`, clase nueva e independiente de `ConfigPanel`): combos
+  `TESTSIG`/`TESTSIG_AMP`/`TESTSIG_FREQ` + botones `START`/`STOP`, y un checkbox por canal que manda
+  `MUX <ch> TEST` (tildado) o `MUX <ch> NORMAL` (destildado) — versión simplificada del combo
+  completo de 8 modos de MUX que sigue existiendo en "Avanzado". La onda se ve en los plots de
+  "Monitor" (siguen recibiendo datos sin importar la pestaña activa). Nota: como es un panel
+  independiente del `ConfigPanel` de "Avanzado", cambiar TESTSIG/MUX desde un lado no actualiza
+  visualmente los controles equivalentes del otro (ambos solo mandan comandos "fire and forget",
+  igual que el resto de la API de CDC1).
+- **"Avanzado"** (todo lo que antes era la UI principal, sin recortar nada): botones "Buscar
+  puertos"/"Auto-detectar CDC"/"Conectar seleccionados"/"Desconectar todo" + spinbox de baudrate +
+  tabla de asignación manual de puerto COM por CDC; `CdcPanel` de texto crudo para CDC0/CDC1;
+  `RldStatusPanel` (grilla completa `LOFF_STATP`/`LOFF_STATN` por electrodo); y **`ConfigPanel`**
+  igual que antes (tabla granular por canal — `GAIN`/`CHPOWER`/`MUX`/`LOFF_CH`/`RLD_CH` — más
+  controles globales `MODE`/`RLD`/`TESTSIG*`/`LOFF_MODE`/`LOFF_TYPE`/`LOFF_CURRENT`/
+  `LOFF_THRESHOLD`/`START`/`STOP` y el botón "Releer configuración actual del ADS1298").
+
+### Filtros de señal (software, scipy — no firmware)
+
+Decisión: los filtros se implementan en Python (`scipy.signal`), no en el ADS1298/RP2040. Motivo:
+iteración inmediata sin recompilar/flashear, conserva el código ADC crudo en el buffer de cada
+`SingleChannelPlot`, y no requiere tocar el chip (la ganancia, RLD y lead-off sí son comandos reales
+de CDC1 que siguen aplicándose en hardware).
+
+- `build_filter_sos(notch_hz, hpf_hz, lpf_hz, fs)`: arma un único array SOS combinando (según qué
+  esté activo) un notch (`scipy.signal.iirnotch`, Q=30, convertido a SOS con `tf2sos`) y/o
+  Butterworth de orden 4 pasaaltos/pasabajos (`scipy.signal.butter(..., output="sos")`), apilados
+  con `np.vstack`. Devuelve `None` si ningún filtro está activo. `fs` = `SingleChannelPlot.
+  ASSUMED_SAMPLE_RATE` (8000, igual al cap de firmware).
+- `SingleChannelPlot.set_filter(sos)` guarda el SOS vigente; `refresh()` lo aplica con
+  `scipy.signal.sosfiltfilt` (**fase cero**, sin retardo) sobre la ventana visible completa en cada
+  redibujado (~30 Hz), después de convertir a mV y antes de graficar. Se eligió fase cero en vez de
+  streaming con estado (`zi`) para no tener que mantener continuidad de filtro entre batches de
+  datos — el costo es recalcular sobre toda la ventana en cada frame, aceptable a esta escala.
+  Si la ventana todavía es muy corta para el padlen que necesita `sosfiltfilt` (arrancando el
+  streaming), se ignora el error y se muestra sin filtrar hasta acumular más muestras.
+- **Alcance confirmado con el usuario**: los filtros se aplican solo a los canales *actualmente
+  visibles* (tildados en la sidebar), no a los 8 siempre — más liviano en cómputo.
+  `MainWindow._on_filter_changed()` recalcula el SOS y lo propaga con `set_filter()` a
+  `self.visible_channels`; `_rebuild_channel_grid()` también llama `set_filter()` sobre los
+  canales que pasan a visibles, para que un canal recién tildado ya aparezca filtrado.
 
 ### Lectura automática de la configuración real del ADS1298 al conectar
 
-Al conectar CDC1 (ya sea al hacer clic en "Conectar seleccionados" o justo después de que el hilo
-de `SerialWorker` confirme la conexión), `MainWindow.read_current_configuration()` manda
-automáticamente un `RREG` por cada registro relevante (`CONFIG_READBACK_REGISTERS`: CONFIG1-3, LOFF,
-CH1SET..CH8SET, RLD_SENSP/N, LOFF_SENSP/N) para que la pestaña "Configuración" refleje cómo estaba
-configurado el chip realmente, en vez de asumir los valores por defecto de fábrica. También hay un
-botón **"Releer configuración actual del ADS1298"** en esa pestaña para repetir la lectura a mano
-(por si se cambió algo por `WREG` crudo o se perdió alguna respuesta).
+Al conectar CDC1 (ya sea vía "Conectar equipo" en "Monitor", "Conectar seleccionados" en
+"Avanzado", o justo después de que el hilo de `SerialWorker` confirme la conexión),
+`MainWindow.read_current_configuration()` manda automáticamente un `RREG` por cada registro
+relevante (`CONFIG_READBACK_REGISTERS`: CONFIG1-3, LOFF, CH1SET..CH8SET, RLD_SENSP/N, LOFF_SENSP/N)
+para que el `ConfigPanel` de "Avanzado" refleje cómo estaba configurado el chip realmente, en vez de
+asumir los valores por defecto de fábrica. También hay un botón **"Releer configuración actual del
+ADS1298"** en esa pestaña para repetir la lectura a mano (por si se cambió algo por `WREG` crudo o
+se perdió alguna respuesta).
 
 - Las respuestas ("`REG XX=YY`", formato de `handle_config_command()` en `usb_manager.cpp`) se
   interceptan en `MainWindow.on_data_received()` con la regex `_REG_RESPONSE_RE` y se despachan a
@@ -349,7 +387,10 @@ botón **"Releer configuración actual del ADS1298"** en esa pestaña para repet
   `inc/ads1298.h`: `GAIN_CODE_TO_VALUE`, `MUX_MODES`, `TEST_FREQ_CODE_TO_TEXT`,
   `LOFF_CURRENT_CODE_TO_TEXT`, `LOFF_MODE_CODE_TO_TEXT`) y actualiza el combo/checkbox
   correspondiente con `blockSignals(True)` para **no** volver a mandar el comando al ADS1298 (evita
-  un loop de reconfiguración al sincronizar el estado).
+  un loop de reconfiguración al sincronizar el estado). Para `CH1SET..CH8SET` además emite
+  `gain_changed(ch, gain)` (aunque venga de una relectura, no de que el usuario haya tocado el
+  combo), para que `MainWindow.on_gain_changed()` también sincronice el combo de ganancia
+  equivalente en la sidebar de "Monitor".
 - Si el usuario cambia algo por `RREG`/`WREG` crudo en vez de por los controles de `ConfigPanel`,
   el GUI también se entera y actualiza los controles (porque escucha cualquier respuesta `REG XX=YY`
   que pase por CDC1, no solo las disparadas por `read_current_configuration()`).
@@ -363,12 +404,13 @@ botón **"Releer configuración actual del ADS1298"** en esa pestaña para repet
 - **VREF se asume fijo en 2.4 V** (referencia interna por defecto, `CONFIG3.VREF_4V=0`) — la API de
   CDC1 no expone ningún comando para cambiar la referencia, así que no hay forma de que el GUI se
   entere si se cambiara por `RREG`/`WREG` crudo.
-- Cada `SingleChannelPlot` (un canal físico por widget, ver "Qué hace" más abajo) guarda su propia
-  `gain` (default 6, igual que el reset de `CHnSET` y el valor inicial del combo `GAIN` en
-  `ConfigPanel`) y la actualiza vía `set_gain()` cuando `MainWindow.on_gain_changed()` recibe
-  `gain_changed` desde `ConfigPanel`. Si el usuario cambia la ganancia por `WREG` directo en vez del
-  combo de `ConfigPanel`, el GUI no se entera y la conversión a mV quedará mal hasta que se use el
-  combo (o se lea de nuevo la configuración, ver botón "Releer configuración actual").
+- Cada `SingleChannelPlot` (un canal físico por widget, ver "Qué hace" más arriba) guarda su propia
+  `gain` (default 6, igual que el reset de `CHnSET` y el valor inicial de los combos `GAIN` en la
+  sidebar de "Monitor" y en `ConfigPanel` de "Avanzado") y la actualiza vía `set_gain()` cuando
+  cambia el combo de ganancia desde cualquiera de esos dos lugares (`_on_sidebar_gain_changed` /
+  `on_gain_changed`, sincronizados entre sí). Si el usuario cambia la ganancia por `WREG` directo,
+  el GUI no se entera y la conversión a mV quedará mal hasta que se use alguno de los combos (o se
+  lea de nuevo la configuración, ver botón "Releer configuración actual").
 - La conversión se aplica en `refresh()` (al momento de dibujar), no al ingerir los datos: si la
   ganancia cambió hace poco, las muestras más viejas que quedan en el buffer circular se dibujan con
   la ganancia *actual*, no con la que tenían en el momento de la captura — aproximación aceptable
@@ -408,8 +450,9 @@ entre canales sin competir por el GIL de Python ni con el hilo de la UI:
 - `MainWindow` tiene un único `QTimer` (`poll_process_queues`, ~30 Hz) que drena sin bloquear
   (`queue.get_nowait()`) todas las colas activas y despacha los batches, vía `pair_channels`, al
   `SingleChannelPlot` de cada canal físico (o a `RldStatusPanel` para CDC6). Un segundo `QTimer`
-  separado (`refresh_plots`, ~30 FPS) redibuja solo los plots de los canales tildados en "Canales
-  visibles", desacoplando la tasa de llegada de datos de la tasa de refresco de pantalla.
+  separado (`refresh_plots`, ~30 FPS) redibuja solo los plots de los canales tildados en la caja
+  "Canales" de la sidebar, desacoplando la tasa de llegada de datos de la tasa de refresco de
+  pantalla.
 - `ThreadConnection` (CDC0/CDC1) y `ProcessConnection` (CDC2-6) son wrappers con la misma interfaz
   mínima (`.port`, `.write_line()`, `.stop()`) guardados en `MainWindow.connections`, para que
   `connect_selected`/`disconnect_all`/`disconnect_one`/`auto_detect_ports` no dupliquen lógica según
@@ -459,10 +502,19 @@ Funciones clave en `emg_multicdc_gui.py`:
   respuesta, etc.).
 - `find_emg_boards(progress_cb=None)` — combina las dos anteriores y devuelve
   `{numero_de_serie: {cdc_index: puerto_com}}`.
-- `MainWindow.auto_detect_ports()` — usa lo anterior, deja elegir la placa si hay más de una
-  conectada, excluye puertos ya abiertos por conexiones activas del propio programa, y rellena los
-  combos de asignación automáticamente. Mientras escanea (abre cada puerto ~0.35s) deshabilita el
-  botón y muestra progreso.
+- `MainWindow._auto_assign_ports()` — extrae el núcleo del escaneo (elegir placa si hay más de una,
+  excluir puertos ya abiertos por conexiones activas del propio programa, rellenar
+  `self.port_combos`) en un método reutilizable que devuelve un resumen (`serial_number`,
+  `assigned`, `missing`, `skipped`) o `None` si no hay placa o se canceló la selección. Mientras
+  escanea (abre cada puerto ~0.35s) deshabilita el botón "Auto-detectar CDC" y muestra progreso.
+  Lo usan **dos** entry points sin duplicar lógica:
+  - `MainWindow.auto_detect_ports()` (botón "Auto-detectar CDC" en "Avanzado"): solo rellena los
+    combos y muestra un `QMessageBox` con el resumen detallado, sin conectar nada (comportamiento
+    histórico, sin cambios).
+  - `MainWindow.connect_equipment()` (botón **"Conectar equipo"**, en la barra superior, visible en
+    las 3 pestañas): además llama a `connect_selected()` para arrancar las conexiones, y solo
+    avisa con un `QMessageBox` si faltó identificar alguna interfaz — pensado para que el usuario
+    clínico no tenga que saber qué es un CDC ni tocar la pestaña "Avanzado" en el uso normal.
 
 Verificado manualmente en este entorno (Windows) con una Pico conectada: el orden real de COM no
 coincidía con el de los CDC (ejemplo real: COM4→CDC6, COM5→CDC1, COM6→CDC2, COM7→CDC5, COM8→CDC4,
@@ -483,9 +535,9 @@ COM9→CDC3, COM10→CDC0), confirmando que la detección por banner es necesari
 
 1. **Validar en hardware la nueva arquitectura de streaming**, en el orden acordado (ahora se puede
    hacer directamente con `emg_multicdc_gui.py`, que ya decodifica y grafica los frames binarios):
-   1. Test signals internas: `TESTSIG ON` + `MUX <ch> TEST` desde la pestaña "Configuración",
-      confirmar la forma de onda esperada (cuadrada, con la amplitud/frecuencia configurada) en el
-      plot del CDC de datos correspondiente.
+   1. Test signals internas: desde la pestaña "Señales de prueba" (`TestSignalPanel`), activar
+      `TESTSIG ON` y tildar los canales a probar, confirmar la forma de onda esperada (cuadrada,
+      con la amplitud/frecuencia configurada) en los plots de la pestaña "Monitor".
    2. Señal continua/DC externa conocida por cada par `INxP`/`INxN`, verificar el valor digital
       esperado según `GAIN` y la referencia de voltaje.
    3. Generador de señales (AC realista), confirmar la cadena completa SPI→USB en condiciones

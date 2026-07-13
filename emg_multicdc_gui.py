@@ -3,7 +3,7 @@
 EMG Multichannel Serial Monitor - PyQt6
 
 Requisitos:
-    pip install pyqt6 pyserial pyqtgraph numpy
+    pip install pyqt6 pyserial pyqtgraph numpy scipy
 
 Uso:
     python emg_multicdc_gui.py
@@ -36,12 +36,33 @@ Streaming binario (CDC2-6) y arquitectura multicore:
     datos ya decodificados a la ventana principal por multiprocessing.Queue,
     que un QTimer drena periódicamente sin bloquear el hilo de la UI.
 
-Pestaña de configuración:
-    La pestaña "Configuración" arma y envía los comandos de la API de CDC1
-    (GAIN, CHPOWER, MODE, RLD, RLD_CH, TESTSIG*, MUX, LOFF_*, START/STOP —
-    ver la tabla completa en CLAUDE.md) usando controles de UI en vez de
-    tipear el texto a mano. RREG/WREG crudos se siguen escribiendo a mano en
-    el panel de texto de CDC1 (pestaña "Monitor").
+Interfaz clínica (3 pestañas):
+    "Monitor" es la pestaña principal: una sidebar a la izquierda (~20% del
+    ancho, selección de canales visibles + ganancia por canal, filtros de
+    software y toggles simples de RLD/lead-off) y a la derecha la grilla de
+    plots de los canales tildados, repartiendo el 80% restante del espacio
+    entre ellos (ver SingleChannelPlot/best_grid_shape). La conexión con el
+    equipo es un solo botón ("Conectar equipo"), sin exponer CDC ni puertos
+    COM al usuario clínico.
+
+    "Señales de prueba" deja activar la test signal interna del ADS1298
+    (TESTSIG/AMP/FREQ) y enrutarla a los canales elegidos (MUX TEST/NORMAL
+    simplificado), para la validación en 3 etapas descrita en CLAUDE.md.
+
+    "Avanzado" concentra todo lo que antes era la UI de debug, sin recortar
+    funcionalidad: mapeo manual de puertos por CDC, paneles de texto crudo de
+    CDC0/CDC1 (incluyendo RREG/WREG a mano), el estado completo de
+    lead-off/RLD por electrodo, y la tabla granular de configuración por
+    canal (ganancia, encendido, mux, lead-off y RLD por P/N).
+
+Filtros de señal (software, no firmware):
+    Notch (50/60 Hz), pasaaltos (20/50 Hz) y pasabajos (150/500 Hz) se
+    implementan en Python con scipy.signal (Butterworth + notch IIR,
+    combinados en un único array SOS por build_filter_sos()) y se aplican en
+    SingleChannelPlot.refresh() con sosfiltfilt (fase cero) sobre la ventana
+    visible completa en cada redibujado, solo a los canales actualmente
+    visibles. No requieren tocar el firmware ni el ADS1298; la ganancia, RLD
+    y lead-off sí son comandos reales de CDC1 y siguen aplicándose en el chip.
 """
 
 import math
@@ -56,6 +77,7 @@ import numpy as np
 import pyqtgraph as pg
 import serial
 import serial.tools.list_ports
+from scipy.signal import butter, iirnotch, tf2sos, sosfiltfilt
 
 from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal, pyqtSlot, Qt
 from PyQt6.QtGui import QKeySequence, QShortcut
@@ -63,7 +85,7 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QLabel, QComboBox, QCheckBox, QLineEdit,
     QGroupBox, QGridLayout, QMessageBox, QSpinBox, QInputDialog,
-    QTabWidget, QScrollArea,
+    QTabWidget, QScrollArea, QSplitter,
 )
 
 
@@ -228,6 +250,33 @@ def code_to_millivolts(codes: np.ndarray, gain: int) -> np.ndarray:
     configurada para ese canal."""
     scale = (ADS1298_VREF_VOLTS * 1000.0) / (gain * ADS1298_FULL_SCALE_CODES)
     return codes.astype(np.float64) * scale
+
+
+def build_filter_sos(notch_hz, hpf_hz, lpf_hz, fs):
+    """Arma un único array SOS (second-order sections) combinando los
+    filtros activos (ver sidebar "Filtros" en MainWindow). Cada argumento de
+    frecuencia puede ser None para desactivar esa etapa. Devuelve None si
+    ningún filtro está activo (sin filtrar).
+
+    Notch: scipy.signal.iirnotch (Q=30). Pasaaltos/pasabajos: Butterworth de
+    orden 4 (scipy.signal.butter). Se aplican en cascada en el orden
+    notch -> HPF -> LPF vía sosfiltfilt (ver SingleChannelPlot.refresh)."""
+    sections = []
+
+    if notch_hz:
+        b, a = iirnotch(notch_hz, Q=30, fs=fs)
+        sections.append(tf2sos(b, a))
+
+    if hpf_hz:
+        sections.append(butter(4, hpf_hz, btype="high", fs=fs, output="sos"))
+
+    if lpf_hz:
+        sections.append(butter(4, lpf_hz, btype="low", fs=fs, output="sos"))
+
+    if not sections:
+        return None
+
+    return np.vstack(sections)
 
 
 def decode_be24_signed(b0: int, b1: int, b2: int) -> int:
@@ -517,6 +566,7 @@ class SingleChannelPlot(QGroupBox):
         super().__init__(f"Canal {channel}")
         self.channel = channel
         self.gain = DEFAULT_GAIN
+        self.filter_sos = None
         self.setMinimumHeight(150)
         self.setMinimumWidth(200)
 
@@ -554,6 +604,12 @@ class SingleChannelPlot(QGroupBox):
         MainWindow cuando cambia el combo GAIN de este canal en la pestaña
         de Configuración)."""
         self.gain = gain
+
+    def set_filter(self, sos):
+        """Actualiza el filtro (array SOS de scipy, o None para desactivar)
+        aplicado a la señal antes de graficarla (ver
+        MainWindow._on_filter_changed / build_filter_sos)."""
+        self.filter_sos = sos
 
     def append_batch(self, values: np.ndarray):
         n = len(values)
@@ -594,7 +650,20 @@ class SingleChannelPlot(QGroupBox):
         # usuario cambió la ganancia hace poco, las muestras más viejas del
         # buffer quedan convertidas con la ganancia nueva (aproximación
         # aceptable para visualización, no para medición de precisión).
-        self.curve.setData(code_to_millivolts(data, self.gain))
+        mv_data = code_to_millivolts(data, self.gain)
+
+        # Filtro de fase cero sobre toda la ventana visible en cada
+        # redibujado: evita tener que mantener estado de filtro (zi) entre
+        # batches de datos. Si la ventana todavía es muy corta para el
+        # padlen que necesita sosfiltfilt (recién arrancando el streaming),
+        # se muestra sin filtrar hasta que se acumulen más muestras.
+        if self.filter_sos is not None:
+            try:
+                mv_data = sosfiltfilt(self.filter_sos, mv_data)
+            except ValueError:
+                pass
+
+        self.curve.setData(mv_data)
 
 
 # ==================================================
@@ -896,6 +965,10 @@ class ConfigPanel(QWidget):
             gain_text = GAIN_CODE_TO_VALUE.get((value & 0x70) >> 4)
             if gain_text is not None:
                 self._set_combo_silently(self.gain_combos.get(ch), str(gain_text))
+                # Propaga también a la sidebar de la pestaña "Monitor" (ver
+                # MainWindow.on_gain_changed), para que la lectura real de
+                # configuración al conectar quede reflejada en ambos lados.
+                self.gain_changed.emit(ch, gain_text)
             self._set_check_silently(self.power_checks.get(ch), not bool(value & 0x80))
             mux_code = value & 0x07
             if mux_code < len(MUX_MODES):
@@ -932,6 +1005,94 @@ class ConfigPanel(QWidget):
         check.blockSignals(True)
         check.setChecked(checked)
         check.blockSignals(False)
+
+
+# ==================================================
+# Pestaña "Señales de prueba": test signal interna del ADS1298
+# ==================================================
+
+
+class TestSignalPanel(QWidget):
+    """Controles simplificados para validar la test signal interna del
+    ADS1298 (ver CLAUDE.md, sección "Próximos pasos", validación en 3
+    etapas). Manda los mismos comandos de CDC1 que la tabla granular de
+    "Avanzado" (TESTSIG/TESTSIG_AMP/TESTSIG_FREQ/MUX/START/STOP), pero con
+    controles pensados para probar rápido: un checkbox de "enviar test
+    signal" por canal en vez del combo completo de 8 modos de MUX.
+
+    Es un panel independiente del ConfigPanel de "Avanzado": ambos mandan
+    comandos por el mismo mecanismo (command_requested -> CDC1) pero no
+    comparten estado visual entre sí (si se cambia algo desde un lado, el
+    combo del otro no se actualiza solo, salvo relectura de configuración)."""
+
+    command_requested = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+
+        self.mux_test_checks = {}
+
+        layout = QVBoxLayout()
+
+        global_box = QGroupBox("Test signal interna")
+        global_layout = QGridLayout()
+
+        global_layout.addWidget(QLabel("Test signal:"), 0, 0)
+        self.testsig_combo = QComboBox()
+        self.testsig_combo.addItems(["OFF", "ON"])
+        self.testsig_combo.currentTextChanged.connect(lambda v: self._send(f"TESTSIG {v}"))
+        global_layout.addWidget(self.testsig_combo, 0, 1)
+
+        global_layout.addWidget(QLabel("Amplitud:"), 0, 2)
+        self.amp_combo = QComboBox()
+        self.amp_combo.addItems(["1", "2"])
+        self.amp_combo.currentTextChanged.connect(lambda v: self._send(f"TESTSIG_AMP {v}"))
+        global_layout.addWidget(self.amp_combo, 0, 3)
+
+        global_layout.addWidget(QLabel("Frecuencia:"), 0, 4)
+        self.freq_combo = QComboBox()
+        self.freq_combo.addItems(["SLOW", "FAST", "DC"])
+        self.freq_combo.currentTextChanged.connect(lambda v: self._send(f"TESTSIG_FREQ {v}"))
+        global_layout.addWidget(self.freq_combo, 0, 5)
+
+        start_button = QPushButton("START")
+        start_button.clicked.connect(lambda: self._send("START"))
+        global_layout.addWidget(start_button, 1, 0)
+
+        stop_button = QPushButton("STOP")
+        stop_button.clicked.connect(lambda: self._send("STOP"))
+        global_layout.addWidget(stop_button, 1, 1)
+
+        global_box.setLayout(global_layout)
+        layout.addWidget(global_box)
+
+        channel_box = QGroupBox("Enviar test signal a estos canales (MUX TEST/NORMAL)")
+        channel_layout = QGridLayout()
+        for ch in range(1, 9):
+            check = QCheckBox(f"Canal {ch}")
+            check.toggled.connect(
+                lambda checked, c=ch: self._send(f"MUX {c} {'TEST' if checked else 'NORMAL'}")
+            )
+            row, col = divmod(ch - 1, 4)
+            channel_layout.addWidget(check, row, col)
+            self.mux_test_checks[ch] = check
+        channel_box.setLayout(channel_layout)
+        layout.addWidget(channel_box)
+
+        note = QLabel(
+            "Activá \"Test signal\" y tildá los canales a probar; la onda "
+            "cuadrada resultante se ve en los plots de la pestaña "
+            "\"Monitor\". Destildá el canal (vuelve a MUX NORMAL) antes de "
+            "medir una señal real."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        layout.addStretch()
+        self.setLayout(layout)
+
+    def _send(self, command: str):
+        self.command_requested.emit(command)
 
 
 # ==================================================
@@ -977,19 +1138,26 @@ class ProcessConnection:
 
 
 class MainWindow(QMainWindow):
+    # Combos de la sidebar de filtros -> parámetro de build_filter_sos().
+    _NOTCH_HZ = {"Apagado": None, "50 Hz": 50, "60 Hz": 60}
+    _HPF_HZ = {"Apagado": None, "20 Hz": 20, "50 Hz": 50}
+    _LPF_HZ = {"Apagado": None, "150 Hz": 150, "500 Hz": 500}
+
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("EMG Multichannel Acquisition - Multi CDC Monitor")
+        self.setWindowTitle("EMG Multichannel Acquisition")
         self.resize(1400, 950)
 
-        self.panels = {}          # CdcPanel (texto) para CDC0/CDC1
+        self.panels = {}          # CdcPanel (texto) para CDC0/CDC1, en "Avanzado"
         self.channel_plots = {}   # SingleChannelPlot por canal físico (1-8)
-        self.channel_checks = {}  # QCheckBox de "canal visible" (1-8)
+        self.channel_checks = {}  # QCheckBox "canal visible" (1-8), en la sidebar
+        self.channel_gain_combos = {}  # QComboBox de ganancia por canal, en la sidebar
         self.visible_channels = []
-        self.rld_panel = None     # RldStatusPanel para CDC6
+        self.rld_panel = None     # RldStatusPanel para CDC6, en "Avanzado"
         self.connections = {}     # name -> ThreadConnection | ProcessConnection
         self.port_combos = {}
+        self.current_filter_sos = None  # sos vigente, aplicado a los canales visibles
 
         # Qué par de canales físicos entrega cada CDC de datos (ver
         # "Formato de trama binaria por USB" en CLAUDE.md).
@@ -1006,115 +1174,39 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout()
         main.setLayout(root)
 
-        title = QLabel("EMG MULTICHANNEL ACQUISITION - MULTI CDC MONITOR")
+        title = QLabel("EMG MULTICHANNEL ACQUISITION")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setStyleSheet("font-size: 20px; font-weight: bold;")
         root.addWidget(title)
 
+        # Barra superior: conexión de un solo botón (sin exponer CDC/puertos
+        # al usuario clínico) + estado agregado + pantalla completa. El flujo
+        # manual por CDC (para debug) vive en la pestaña "Avanzado".
         top = QHBoxLayout()
 
-        self.refresh_button = QPushButton("Buscar puertos")
-        self.autodetect_button = QPushButton("Auto-detectar CDC")
-        self.connect_button = QPushButton("Conectar seleccionados")
-        self.disconnect_button = QPushButton("Desconectar todo")
+        self.connect_equipment_button = QPushButton("Conectar equipo")
+        self.disconnect_equipment_button = QPushButton("Desconectar equipo")
+        self.equipment_status_label = QLabel("Equipo desconectado")
+        self.equipment_status_label.setStyleSheet("color: red; font-weight: bold;")
         self.fullscreen_button = QPushButton("Pantalla completa (F11)")
 
-        self.baud = QSpinBox()
-        self.baud.setRange(1200, 2000000)
-        self.baud.setValue(115200)
-        self.baud.setSingleStep(9600)
-
-        top.addWidget(self.refresh_button)
-        top.addWidget(self.autodetect_button)
-        top.addWidget(QLabel("Baudrate:"))
-        top.addWidget(self.baud)
-        top.addWidget(self.connect_button)
-        top.addWidget(self.disconnect_button)
+        top.addWidget(self.connect_equipment_button)
+        top.addWidget(self.disconnect_equipment_button)
+        top.addWidget(self.equipment_status_label)
         top.addStretch()
         top.addWidget(self.fullscreen_button)
 
         root.addLayout(top)
 
-        mapping_box = QGroupBox("Asignación de puertos COM")
-        mapping = QGridLayout()
-
-        for i, name in enumerate(CDC_NAMES):
-            label = QLabel(name)
-            combo = QComboBox()
-            combo.addItem("No conectar", None)
-            self.port_combos[name] = combo
-
-            mapping.addWidget(label, i, 0)
-            mapping.addWidget(combo, i, 1)
-
-        mapping_box.setLayout(mapping)
-        root.addWidget(mapping_box)
-
         tabs = QTabWidget()
         root.addWidget(tabs)
 
-        monitor_tab = QWidget()
-        monitor_layout = QVBoxLayout()
+        tabs.addTab(self._build_monitor_tab(), "Monitor")
+        tabs.addTab(self._build_test_signal_tab(), "Señales de prueba")
+        tabs.addTab(self._build_advanced_tab(), "Avanzado")
 
-        # Fila superior compacta: debug, configuración (texto crudo) y RLD.
-        top_row = QHBoxLayout()
-        for idx, name in ((0, CDC_NAMES[0]), (1, CDC_NAMES[1])):
-            widget = CdcPanel(name)
-            widget.send_requested.connect(self.send_to_cdc)
-            self.panels[name] = widget
-            top_row.addWidget(widget)
-
-        self.rld_panel = RldStatusPanel(CDC_NAMES[6])
-        top_row.addWidget(self.rld_panel)
-        monitor_layout.addLayout(top_row)
-
-        # Selector de qué canales físicos (1-8) se muestran en la grilla de
-        # abajo; todos empiezan visibles.
-        channel_select_box = QGroupBox("Canales visibles")
-        channel_select_layout = QHBoxLayout()
-        for ch in range(1, 9):
-            check = QCheckBox(f"Canal {ch}")
-            check.setChecked(True)
-            check.toggled.connect(self._rebuild_channel_grid)
-            channel_select_layout.addWidget(check)
-            self.channel_checks[ch] = check
-        channel_select_box.setLayout(channel_select_layout)
-        monitor_layout.addWidget(channel_select_box)
-
-        # Los 8 plots se crean siempre (siguen recibiendo y bufferizando
-        # datos aunque estén ocultos); solo su presencia en channel_grid y
-        # su redibujado en refresh_plots() depende de la selección.
-        for ch in range(1, 9):
-            self.channel_plots[ch] = SingleChannelPlot(ch)
-
-        self.channel_grid_container = QWidget()
-        self.channel_grid = QGridLayout()
-        self.channel_grid_container.setLayout(self.channel_grid)
-        monitor_layout.addWidget(self.channel_grid_container, stretch=1)
-
-        monitor_tab.setLayout(monitor_layout)
-
-        monitor_scroll = QScrollArea()
-        monitor_scroll.setWidgetResizable(True)
-        monitor_scroll.setWidget(monitor_tab)
-        tabs.addTab(monitor_scroll, "Monitor")
-
-        self._rebuild_channel_grid()
-
-        self.config_panel = ConfigPanel()
-        self.config_panel.command_requested.connect(self.send_config_command)
-        self.config_panel.gain_changed.connect(self.on_gain_changed)
-        self.config_panel.reread_requested.connect(self.read_current_configuration)
-
-        config_scroll = QScrollArea()
-        config_scroll.setWidgetResizable(True)
-        config_scroll.setWidget(self.config_panel)
-        tabs.addTab(config_scroll, "Configuración")
-
-        self.refresh_button.clicked.connect(self.refresh_ports)
-        self.autodetect_button.clicked.connect(self.auto_detect_ports)
-        self.connect_button.clicked.connect(self.connect_selected)
-        self.disconnect_button.clicked.connect(self.disconnect_all)
+        self.connect_equipment_button.clicked.connect(self.connect_equipment)
+        self.disconnect_equipment_button.clicked.connect(self.disconnect_all)
         self.fullscreen_button.clicked.connect(self.toggle_fullscreen)
         QShortcut(QKeySequence("F11"), self, activated=self.toggle_fullscreen)
 
@@ -1130,24 +1222,303 @@ class MainWindow(QMainWindow):
 
         self.refresh_ports()
 
-    def auto_detect_ports(self):
-        """Escanea los puertos COM, abre brevemente cada uno perteneciente al
-        dispositivo EMG (VID 0xCAFE) y lee el banner de bienvenida del
-        firmware para determinar con certeza a qué CDC pertenece."""
+    # ---- Construcción de las 3 pestañas ----
+
+    def _build_monitor_tab(self) -> QWidget:
+        """Pestaña principal: sidebar (~20% del ancho) con selección de
+        canales/ganancia, filtros y RLD/lead-off, más la grilla de plots de
+        los canales visibles ocupando el 80% restante (ver QSplitter)."""
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        sidebar_scroll = QScrollArea()
+        sidebar_scroll.setWidgetResizable(True)
+        sidebar_scroll.setWidget(self._build_sidebar())
+        splitter.addWidget(sidebar_scroll)
+
+        # Los 8 plots se crean siempre (siguen recibiendo y bufferizando
+        # datos aunque estén ocultos); solo su presencia en channel_grid y
+        # su redibujado en refresh_plots() depende de la selección.
+        for ch in range(1, 9):
+            self.channel_plots[ch] = SingleChannelPlot(ch)
+
+        self.channel_grid_container = QWidget()
+        self.channel_grid = QGridLayout()
+        self.channel_grid_container.setLayout(self.channel_grid)
+        splitter.addWidget(self.channel_grid_container)
+
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 4)
+        splitter.setSizes([280, 1120])  # proporción inicial ~20/80
+
+        self._rebuild_channel_grid()
+
+        return splitter
+
+    def _build_sidebar(self) -> QWidget:
+        sidebar = QWidget()
+        layout = QVBoxLayout()
+        sidebar.setLayout(layout)
+
+        layout.addWidget(self._build_channel_box())
+        layout.addWidget(self._build_filter_box())
+        layout.addWidget(self._build_rld_leadoff_box())
+        layout.addStretch()
+
+        return sidebar
+
+    def _build_channel_box(self) -> QGroupBox:
+        box = QGroupBox("Canales")
+        grid = QGridLayout()
+        grid.addWidget(QLabel("<b>Ver</b>"), 0, 0)
+        grid.addWidget(QLabel("<b>Canal</b>"), 0, 1)
+        grid.addWidget(QLabel("<b>Ganancia</b>"), 0, 2)
+
+        for ch in range(1, 9):
+            row = ch
+
+            check = QCheckBox()
+            check.setChecked(True)
+            check.toggled.connect(self._rebuild_channel_grid)
+            grid.addWidget(check, row, 0)
+            self.channel_checks[ch] = check
+
+            grid.addWidget(QLabel(f"Canal {ch}"), row, 1)
+
+            gain_combo = QComboBox()
+            gain_combo.addItems(GAIN_VALUES)
+            gain_combo.setCurrentText(str(DEFAULT_GAIN))
+            gain_combo.currentTextChanged.connect(
+                lambda value, c=ch: self._on_sidebar_gain_changed(c, value)
+            )
+            grid.addWidget(gain_combo, row, 2)
+            self.channel_gain_combos[ch] = gain_combo
+
+        box.setLayout(grid)
+        return box
+
+    def _build_filter_box(self) -> QGroupBox:
+        box = QGroupBox("Filtros (canales visibles)")
+        layout = QGridLayout()
+
+        layout.addWidget(QLabel("Notch:"), 0, 0)
+        self.notch_combo = QComboBox()
+        self.notch_combo.addItems(list(self._NOTCH_HZ.keys()))
+        self.notch_combo.currentTextChanged.connect(self._on_filter_changed)
+        layout.addWidget(self.notch_combo, 0, 1)
+
+        layout.addWidget(QLabel("Pasaaltos:"), 1, 0)
+        self.hpf_combo = QComboBox()
+        self.hpf_combo.addItems(list(self._HPF_HZ.keys()))
+        self.hpf_combo.currentTextChanged.connect(self._on_filter_changed)
+        layout.addWidget(self.hpf_combo, 1, 1)
+
+        layout.addWidget(QLabel("Pasabajos:"), 2, 0)
+        self.lpf_combo = QComboBox()
+        self.lpf_combo.addItems(list(self._LPF_HZ.keys()))
+        self.lpf_combo.currentTextChanged.connect(self._on_filter_changed)
+        layout.addWidget(self.lpf_combo, 2, 1)
+
+        box.setLayout(layout)
+        return box
+
+    def _build_rld_leadoff_box(self) -> QGroupBox:
+        box = QGroupBox("RLD / Lead-off")
+        layout = QVBoxLayout()
+
+        self.rld_toggle = QCheckBox("RLD activo")
+        self.rld_toggle.toggled.connect(self._on_rld_toggle)
+        layout.addWidget(self.rld_toggle)
+
+        self.leadoff_toggle = QCheckBox("Lead-off activo")
+        self.leadoff_toggle.toggled.connect(self._on_leadoff_toggle)
+        layout.addWidget(self.leadoff_toggle)
+
+        note = QLabel(
+            "La configuración fina (por electrodo, modo DC/AC, corriente y "
+            "umbral) está en la pestaña \"Avanzado\"."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        box.setLayout(layout)
+        return box
+
+    def _build_test_signal_tab(self) -> QWidget:
+        self.test_signal_panel = TestSignalPanel()
+        self.test_signal_panel.command_requested.connect(self.send_config_command)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self.test_signal_panel)
+        return scroll
+
+    def _build_advanced_tab(self) -> QWidget:
+        """Todo lo que antes era la UI principal de debug: mapeo manual de
+        puertos por CDC, paneles de texto crudo, estado detallado de
+        lead-off/RLD y la tabla granular de configuración por canal. Nada de
+        esto se recorta — solo se relocaliza acá."""
+        advanced = QWidget()
+        layout = QVBoxLayout()
+        advanced.setLayout(layout)
+
+        conn_row = QHBoxLayout()
+        self.refresh_button = QPushButton("Buscar puertos")
+        self.autodetect_button = QPushButton("Auto-detectar CDC")
+        self.connect_button = QPushButton("Conectar seleccionados")
+        self.disconnect_button = QPushButton("Desconectar todo")
+
+        self.baud = QSpinBox()
+        self.baud.setRange(1200, 2000000)
+        self.baud.setValue(115200)
+        self.baud.setSingleStep(9600)
+
+        conn_row.addWidget(self.refresh_button)
+        conn_row.addWidget(self.autodetect_button)
+        conn_row.addWidget(QLabel("Baudrate:"))
+        conn_row.addWidget(self.baud)
+        conn_row.addWidget(self.connect_button)
+        conn_row.addWidget(self.disconnect_button)
+        conn_row.addStretch()
+        layout.addLayout(conn_row)
+
+        mapping_box = QGroupBox("Asignación de puertos COM")
+        mapping = QGridLayout()
+
+        for i, name in enumerate(CDC_NAMES):
+            label = QLabel(name)
+            combo = QComboBox()
+            combo.addItem("No conectar", None)
+            self.port_combos[name] = combo
+
+            mapping.addWidget(label, i, 0)
+            mapping.addWidget(combo, i, 1)
+
+        mapping_box.setLayout(mapping)
+        layout.addWidget(mapping_box)
+
+        top_row = QHBoxLayout()
+        for name in (CDC_NAMES[0], CDC_NAMES[1]):
+            widget = CdcPanel(name)
+            widget.send_requested.connect(self.send_to_cdc)
+            self.panels[name] = widget
+            top_row.addWidget(widget)
+
+        self.rld_panel = RldStatusPanel(CDC_NAMES[6])
+        top_row.addWidget(self.rld_panel)
+        layout.addLayout(top_row)
+
+        self.config_panel = ConfigPanel()
+        self.config_panel.command_requested.connect(self.send_config_command)
+        self.config_panel.gain_changed.connect(self.on_gain_changed)
+        self.config_panel.reread_requested.connect(self.read_current_configuration)
+        layout.addWidget(self.config_panel)
+
+        layout.addStretch()
+
+        self.refresh_button.clicked.connect(self.refresh_ports)
+        self.autodetect_button.clicked.connect(self.auto_detect_ports)
+        self.connect_button.clicked.connect(self.connect_selected)
+        self.disconnect_button.clicked.connect(self.disconnect_all)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(advanced)
+        return scroll
+
+    # ---- Filtros, ganancia y RLD/lead-off desde la sidebar ----
+
+    def _on_filter_changed(self, _value=None):
+        notch = self._NOTCH_HZ[self.notch_combo.currentText()]
+        hpf = self._HPF_HZ[self.hpf_combo.currentText()]
+        lpf = self._LPF_HZ[self.lpf_combo.currentText()]
+
+        self.current_filter_sos = build_filter_sos(
+            notch, hpf, lpf, SingleChannelPlot.ASSUMED_SAMPLE_RATE
+        )
+        for ch in self.visible_channels:
+            self.channel_plots[ch].set_filter(self.current_filter_sos)
+
+    def _on_sidebar_gain_changed(self, channel: int, gain_text: str):
+        self.send_config_command(f"GAIN {channel} {gain_text}")
+        self.channel_plots[channel].set_gain(int(gain_text))
+
+        combo = self.config_panel.gain_combos.get(channel)
+        if combo is not None:
+            combo.blockSignals(True)
+            combo.setCurrentText(gain_text)
+            combo.blockSignals(False)
+
+    def _on_rld_toggle(self, checked: bool):
+        self.send_config_command(f"RLD {'ON' if checked else 'OFF'}")
+
+    def _on_leadoff_toggle(self, checked: bool):
+        value = 1 if checked else 0
+        for ch in range(1, 9):
+            self.send_config_command(f"LOFF_CH {ch} P {value}")
+            self.send_config_command(f"LOFF_CH {ch} N {value}")
+
+    # ---- Conexión ----
+
+    def connect_equipment(self):
+        """Flujo clínico: auto-detecta y conecta las 7 interfaces del equipo
+        en un solo paso, sin que el usuario tenga que saber qué es un CDC ni
+        elegir puertos COM a mano (reusa _auto_assign_ports/connect_selected,
+        las mismas funciones que usa el flujo manual de "Avanzado")."""
+        result = self._auto_assign_ports()
+
+        if result is None:
+            if not group_ports_by_serial():
+                QMessageBox.warning(
+                    self,
+                    "Conectar equipo",
+                    "No se encontró ningún equipo EMG conectado.\n\n"
+                    "Verificá el cable USB y que el equipo esté encendido."
+                )
+            return
+
+        self.connect_selected()
+
+        if result["missing"]:
+            QMessageBox.warning(
+                self,
+                "Conectar equipo",
+                "No se pudieron identificar todas las interfaces del equipo.\n"
+                "Faltantes: " + ", ".join(result["missing"]) +
+                "\n\nProbá reconectar el cable USB o revisar la pestaña "
+                "\"Avanzado\"."
+            )
+
+    def _refresh_equipment_status_label(self):
+        connected = sum(1 for name in CDC_NAMES if name in self.connections)
+        total = len(CDC_NAMES)
+
+        if connected == 0:
+            self.equipment_status_label.setText("Equipo desconectado")
+            self.equipment_status_label.setStyleSheet("color: red; font-weight: bold;")
+        elif connected == total:
+            self.equipment_status_label.setText("Equipo conectado")
+            self.equipment_status_label.setStyleSheet("color: green; font-weight: bold;")
+        else:
+            self.equipment_status_label.setText(
+                f"Equipo parcialmente conectado ({connected}/{total})"
+            )
+            self.equipment_status_label.setStyleSheet("color: #b8860b; font-weight: bold;")
+
+    def _auto_assign_ports(self):
+        """Escanea los puertos COM del dispositivo EMG (VID 0xCAFE), abre
+        brevemente cada uno y lee el banner de bienvenida del firmware para
+        determinar con certeza a qué CDC pertenece, completando
+        self.port_combos. Reutilizado tanto por el botón clínico "Conectar
+        equipo" como por "Auto-detectar CDC" en "Avanzado".
+
+        Devuelve un dict {serial_number, assigned, missing, skipped} con el
+        resumen, o None si no hay ninguna placa EMG conectada o el usuario
+        canceló la selección de placa (cuando hay más de una)."""
         self.refresh_ports()
 
         grouped = group_ports_by_serial()
-
         if not grouped:
-            QMessageBox.warning(
-                self,
-                "Auto-detección",
-                "No se encontró ningún dispositivo EMG (VID 0xCAFE) en los "
-                "puertos COM.\n\nVerifica que la Pico esté conectada y que "
-                "el firmware haya enumerado correctamente (revisa el "
-                "Administrador de dispositivos de Windows)."
-            )
-            return
+            return None
 
         # Los puertos ya conectados por este programa no se pueden reabrir;
         # se excluyen del escaneo para no interferir con esas conexiones.
@@ -1166,7 +1537,7 @@ class MainWindow(QMainWindow):
                 False,
             )
             if not ok:
-                return
+                return None
 
         candidates = [d for d in grouped[serial_number] if d not in busy_ports]
         skipped = [d for d in grouped[serial_number] if d in busy_ports]
@@ -1209,16 +1580,41 @@ class MainWindow(QMainWindow):
             combo.setCurrentIndex(idx)
             assigned += 1
 
+        return {
+            "serial_number": serial_number,
+            "assigned": assigned,
+            "missing": missing,
+            "skipped": skipped,
+        }
+
+    def auto_detect_ports(self):
+        """Botón "Auto-detectar CDC" de la pestaña "Avanzado": igual que
+        antes, solo rellena self.port_combos y muestra un resumen detallado
+        (sin conectar nada)."""
+        result = self._auto_assign_ports()
+
+        if result is None:
+            if not group_ports_by_serial():
+                QMessageBox.warning(
+                    self,
+                    "Auto-detección",
+                    "No se encontró ningún dispositivo EMG (VID 0xCAFE) en los "
+                    "puertos COM.\n\nVerifica que la Pico esté conectada y que "
+                    "el firmware haya enumerado correctamente (revisa el "
+                    "Administrador de dispositivos de Windows)."
+                )
+            return
+
         message = (
-            f"Placa (serie {serial_number}): "
-            f"se asignaron {assigned}/{len(CDC_NAMES)} interfaces CDC."
+            f"Placa (serie {result['serial_number']}): "
+            f"se asignaron {result['assigned']}/{len(CDC_NAMES)} interfaces CDC."
         )
-        if missing:
-            message += "\nNo se detectaron: " + ", ".join(missing)
-        if skipped:
+        if result["missing"]:
+            message += "\nNo se detectaron: " + ", ".join(result["missing"])
+        if result["skipped"]:
             message += (
                 "\nPuertos omitidos por estar ya conectados en este "
-                "programa: " + ", ".join(skipped)
+                "programa: " + ", ".join(result["skipped"])
             )
 
         QMessageBox.information(self, "Auto-detección", message)
@@ -1274,6 +1670,8 @@ class MainWindow(QMainWindow):
                 frame_mode = "rld" if idx == 6 else "data"
                 self.start_process_connection(name, port, baudrate, frame_mode)
 
+        self._refresh_equipment_status_label()
+
     def start_thread_connection(self, name: str, port: str, baudrate: int):
         thread = QThread()
         worker = SerialWorker(name, port, baudrate)
@@ -1303,6 +1701,7 @@ class MainWindow(QMainWindow):
     def disconnect_all(self):
         for name in list(self.connections.keys()):
             self.disconnect_one(name)
+        self._refresh_equipment_status_label()
 
     def disconnect_one(self, name: str):
         conn = self.connections.pop(name, None)
@@ -1326,6 +1725,7 @@ class MainWindow(QMainWindow):
                     self._update_connection_status(name, connected, text)
                     if not connected:
                         self.connections.pop(name, None)
+                    self._refresh_equipment_status_label()
                 elif tag == "frame":
                     _, values_a, values_b = msg
                     channel_a, channel_b = self.pair_channels.get(name, (None, None))
@@ -1364,16 +1764,23 @@ class MainWindow(QMainWindow):
         for i, ch in enumerate(self.visible_channels):
             row, col = divmod(i, cols)
             self.channel_grid.addWidget(self.channel_plots[ch], row, col)
+            self.channel_plots[ch].set_filter(self.current_filter_sos)
             self.channel_plots[ch].show()
 
     @pyqtSlot(int, int)
     def on_gain_changed(self, channel: int, gain: int):
-        """Propaga un cambio de ganancia (desde la pestaña de Configuración)
-        al plot de ese canal, para que la conversión a mV use el valor
-        correcto."""
+        """Propaga un cambio de ganancia (desde la pestaña "Avanzado" o
+        desde una relectura de configuración real del ADS1298) al plot de
+        ese canal y al combo de ganancia de la sidebar en "Monitor"."""
         plot = self.channel_plots.get(channel)
         if plot:
             plot.set_gain(gain)
+
+        combo = self.channel_gain_combos.get(channel)
+        if combo is not None:
+            combo.blockSignals(True)
+            combo.setCurrentText(str(gain))
+            combo.blockSignals(False)
 
     def toggle_fullscreen(self):
         if self.isFullScreen():
@@ -1424,6 +1831,8 @@ class MainWindow(QMainWindow):
             conn = self.connections.pop(name, None)
             if isinstance(conn, ThreadConnection):
                 conn.thread.quit()
+
+        self._refresh_equipment_status_label()
 
     def read_current_configuration(self):
         """Lee los registros relevantes del ADS1298 por CDC1 (RREG) para que
