@@ -37,6 +37,7 @@ pico_sdk_init()
 add_executable(EMG
         src/EMG.cpp
         src/ads1298.cpp
+        src/acquisition.cpp
         src/usb_manager.cpp
         src/usb_descriptors.c
         )
@@ -54,6 +55,7 @@ target_include_directories(EMG PRIVATE
 target_link_libraries(EMG
         pico_stdlib
         hardware_spi
+        pico_multicore
         tinyusb_device
         tinyusb_board
         )

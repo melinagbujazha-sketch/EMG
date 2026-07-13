@@ -17,23 +17,23 @@ Implementado:
 - Lectura del registro ID (`readId`/`checkId`) para verificar comunicación con el chip.
 - 7 interfaces USB CDC vía TinyUSB, con descriptores y manejo básico de comandos (`usb_manager`,
   `usb_descriptors.c`).
-- Comando `ID` / `READ_ID` por el canal de configuración (CDC1) que lee y devuelve el registro ID.
 - Mensajes de debug por CDC0.
 - Banner de bienvenida por cada CDC al conectar (DTR→1) con el nombre de la interfaz entre
   paréntesis (p. ej. `"DATA STREAM CH1-CH2 (CDC2)"`), usado también para identificación automática
   de puertos desde la GUI de Python (ver más abajo).
-- GUI de monitoreo en Python (`emg_multicdc_gui.py`, PyQt6 + pyserial) con un panel por CDC,
-  auto-detección de qué puerto COM corresponde a cada CDC, y envío/recepción de texto por canal.
+- GUI de monitoreo en Python (`emg_multicdc_gui.py`, PyQt6 + pyserial + pyqtgraph + numpy) con
+  auto-detección de qué puerto COM corresponde a cada CDC, panel de texto para CDC0/CDC1, **plots en
+  tiempo real** de los 8 canales EMG (CDC2-5) y **panel de estado de lead-off/RLD** (CDC6), más una
+  **pestaña de configuración** con controles para toda la API de CDC1. Ver sección "Herramienta PC"
+  más abajo para el detalle completo.
+- **Streaming continuo multicore** de los 8 canales EMG + estado de lead-off por USB, y una **API de
+  configuración completa** por CDC1 (ganancia, encendido de canales, modo HR/LP, RLD, test signals,
+  mux de entrada, lead-off detection). Ver sección "Arquitectura de adquisición y streaming" más
+  abajo para el detalle completo.
 
-Pendiente (no implementado todavía, ver comentarios "Futuro" en el código):
-- Streaming continuo de datos de conversión del ADS1298 (RDATAC / DRDY) hacia los CDC 2-5 (canales
-  EMG) y CDC6 (RLD).
-- Protocolo de configuración full-duplex real por CDC1 (por ahora solo entiende `ID`/`READ_ID` y
-  responde `OK` a cualquier otra cosa).
-- Escritura de registros de configuración del ADS1298 (ganancia, mux de canal, data rate, lead-off,
-  RLD, etc.) desde comandos por CDC1.
-- Uso de la línea DRDY (GP20) para sincronizar la lectura de datos (implementado `drdyIsLow()` pero
-  aún no usado en el loop principal).
+Pendiente:
+- Sin pruebas en hardware todavía de la nueva arquitectura de streaming ni del GUI actualizado
+  (recién implementados; falta la validación en 3 etapas descrita en "Próximos pasos").
 
 ## Hardware
 
@@ -94,16 +94,20 @@ ID(0x00), CONFIG1-4, LOFF, CH1SET..CH8SET (0x05-0x0C), RLD_SENSP/N, LOFF_SENSP/N
 LOFF_STATP/N (solo lectura), GPIO, PACE, RESP, WCT1, WCT2. Ver tabla completa de bits en la sección
 9.6 del datasheet.
 
-#### Formato de datos de salida (para cuando se implemente streaming)
+#### Formato de datos de salida del ADS1298 (por SPI, vía RDATA)
 
 - Precedido por un **status word** de 24 bits: `1 1 0 0 LOFF_STATP[7:0] LOFF_STATN[7:0] GPIO[7:4]`.
 - Cada canal: 24 bits en complemento a 2, MSB primero (17 o 19 bits útiles si DR=000/001).
-- Total con 8 canales a resolución de 24 bits: 24 (status) + 8×24 = 216 bits por frame.
-- A 32 kSPS / 64 kSPS los canales son de 16 bits (24 status + 8×16 = 152 bits).
+- Total con 8 canales a resolución de 24 bits: 24 (status) + 8×24 = 216 bits por frame (28 bytes:
+  1 de opcode RDATA + 27 de respuesta). A data rates de 8 kSPS (el cap usado en este firmware) el
+  frame siempre es de 24 bits/canal.
 - DRDY (activo en bajo) indica dato listo; se limpia en el primer flanco de bajada de SCLK tras
   DRDY, independientemente de si se lee el dato o no.
-- Lectura recomendada con **RDATA** (mejor para sistemas tipo ECG/EMG donde se cambian registros
-  seguido) o **RDATAC** (mejor para loggers donde los registros no cambian).
+- El firmware usa **RDATA** (no RDATAC) por cada flanco de DRDY: `ads1298::readDataFrame()` en
+  `src/ads1298.cpp` hace la transacción SPI completa (opcode + 27 bytes de respuesta) en una sola
+  llamada y devuelve el status word (3 bytes) + los 8 canales ya con signo extendido a `int32_t`.
+  `ads1298::extractLoffStatP/N()` separan `LOFF_STATP`/`LOFF_STATN` del status word (ver Figura 61
+  del datasheet, "Status Word Content", para el detalle bit a bit).
 
 #### Timing relevante
 
@@ -113,35 +117,162 @@ LOFF_STATP/N (solo lectura), GPIO, PACE, RESP, WCT1, WCT2. Ver tabla completa de
   más alto, HR) hasta 36872 tCLK (DR más bajo, LP).
 - Después de un cambio de entrada (step), el filtro digital tarda 3-4 × tDR en asentarse.
 
+## Arquitectura de adquisición y streaming (multicore)
+
+Implementada para cumplir con el presupuesto de throughput USB validado (ver sección siguiente) y
+para no bloquear la adquisición con el procesamiento de comandos de configuración. El plan de
+diseño original (con el contexto completo de las decisiones tomadas) quedó guardado en
+`docs/plan_streaming_multicore.md`.
+
+### Reparto de cores
+
+- **Core 1** (`acquisition_core1_entry()` en `src/acquisition.cpp`, lanzado desde `EMG.cpp` con
+  `multicore_launch_core1`): hace polling de `drdyIsLow()` en loop cerrado. Cuando DRDY está en
+  bajo, toma `ads.lock()`, llama `ads.readDataFrame(status, channels)` (un solo `RDATA` por SPI),
+  libera el lock, y empuja los 4 pares de canales + el estado de lead-off a las colas de
+  `usb_manager` (`emg_usb_push_channel_pair`/`emg_usb_push_rld_status`). **Nunca llama funciones
+  `tud_*`.**
+- **Core 0** (`main()` en `EMG.cpp`, loop de `emg_usb_task()`): único core que toca TinyUSB. Llama
+  `tud_task()`, drena las 5 colas (4 de datos + 1 de RLD, `queue_t` de `pico/util/queue.h`,
+  definidas en `usb_manager.cpp`) y manda los frames binarios por `tud_cdc_n_write`. También atiende
+  los comandos de configuración de CDC1 (`tud_cdc_rx_cb` → `handle_config_command()`), que usan
+  `ads.lock()`/`ads.unlock()` alrededor de cualquier `RREG`/`WREG` para no pisar una transacción SPI
+  en curso del core 1.
+- **Mutex compartido**: `ads1298::_bus_mutex` (pico/mutex.h), inicializado en `ads1298::init()`,
+  expuesto como `ads.lock()`/`ads.unlock()`. Protege *toda* transacción SPI hacia el chip. Como el
+  firmware nunca vuelve a modo `RDATAC` (usa `RDATA` exclusivamente, ver más abajo), los comandos
+  `RREG`/`WREG` no necesitan mandar `SDATAC` antes de cada operación ni restablecer ningún modo de
+  streaming después — alcanza con tomar el mutex.
+- Si en el futuro se cambia el mapeo de canales por CDC o el número de interfaces de datos, hay que
+  actualizar `DATA_CDC_COUNT` en `usb_manager.cpp` y los índices fijos usados en
+  `acquisition_core1_entry()`.
+
+### Presupuesto de throughput USB (validado)
+
+- **Cap de data rate: 8 kSPS** (`CONFIG1.DR = 010b` en modo HR, `DEFAULT_CONFIG1` en `EMG.cpp`).
+  A esta tasa el throughput total (~224 KB/s en los 4 CDC de datos, trama de 7 bytes c/u) queda muy
+  por debajo del techo práctico de USB Full Speed (~1 MB/s agregado; RP2040 no tiene High Speed),
+  con margen amplio para el ancho de banda real de una señal EMG (~20 Hz-1 kHz). El comando `MODE`
+  (ver tabla de comandos) solo alterna HR/LP sin tocar este límite de `DR`.
+- **`CONFIG3.PD_REFBUF` (buffer de referencia interno) debe habilitarse explícitamente.**
+  `configure_ads_defaults()` en `EMG.cpp` escribe `DEFAULT_CONFIG3 = 0x40 |
+  CONFIG3_PD_REFBUF_BIT` (bit reservado siempre en 1 + PD_REFBUF=1), y espera
+  150 ms (`sleep_ms(150)` en `main()`) antes de `startConversions()` para que
+  la referencia se establezca. **Bug real corregido:** el firmware nunca
+  tocaba `CONFIG3`, así que el chip arrancaba con el buffer de referencia
+  apagado (reset de fábrica). Con VREFP sin excitar, cualquier medición que
+  dependa de la referencia interna de 2.4V queda con amplitud/offset
+  indefinidos — esto se detectó analizando estadísticamente una captura de
+  la test signal interna (`MUX 1 TEST` + `TESTSIG ON`) que mostraba una
+  distribución ~gaussiana con media ~45 mV y desvío ~5 mV (en vez de los
+  ~0 mV ± 1-2 mV esperados), aunque con una periodicidad real de ~4 Hz que
+  coincidía con `TESTSIG_FREQ FAST` (confirmando que el MUX/test-signal sí
+  se estaba aplicando, pero con la referencia inválida). Como esto afecta
+  también a las mediciones reales (no solo a la test signal), es un bug que
+  hay que validar en hardware antes de confiar en cualquier lectura de EMG.
+- Como el ADS1298 muestrea los 8 canales simultáneamente, cada evento de DRDY ya trae ambos canales
+  de un mismo CDC juntos en una sola trama — no hace falta un bit discriminador de canal.
+
+### Formato de trama binaria por USB
+
+Cada CDC de datos (CDC2-5, 2 canales físicos cada uno) manda, por cada evento de DRDY:
+
+```
+[0]     marcador de sync (0xAA)
+[1..3]  canal A, 24 bits, complemento a 2, MSB primero
+[4..6]  canal B, 24 bits, complemento a 2, MSB primero
+```
+
+7 bytes por trama (`write_channel_be24()` en `usb_manager.cpp`). CDC6 (RLD/lead-off) manda:
+
+```
+[0] marcador de sync (0xAA)
+[1] LOFF_STATP (8 bits, uno por canal)
+[2] LOFF_STATN (8 bits, uno por canal)
+```
+
+3 bytes por trama, a la misma cadencia que los datos (viene gratis en el status word de cada
+`RDATA`, no requiere una lectura de registro aparte). `RLD_STAT` (si conectado o no el electrodo
+RLD) **no** se transmite en este stream continuo porque vive en `CONFIG3` (no en el status word por
+muestra) y leerlo cada muestra agregaría tráfico SPI innecesario; se puede consultar bajo demanda
+con `RREG 03` desde CDC1.
+
+**Escrituras USB atómicas:** `emg_usb_write()`, `emg_usb_write_line()`, `drain_data_queue()` y
+`drain_rld_queue()` verifican `tud_cdc_n_write_available(itf)` **antes** de escribir (y antes de
+sacar el elemento de la cola, en el caso de las tramas de datos): si no entra el mensaje/trama
+completo en el FIFO de TX de TinyUSB, se descarta entero en vez de escribirlo a medias. Esto
+corrige un bug real observado en hardware: `tud_cdc_n_write()` trunca en silencio si no hay
+espacio, y una trama de datos a medias corrompía el framing de todas las tramas siguientes hasta el
+próximo resincronismo (se veía como picos de ruido absurdos en la señal), y un mensaje de texto a
+medias producía líneas de debug concatenadas/truncadas en CDC0 (visto en la práctica con ráfagas de
+comandos, p. ej. los 16 `RREG` de `read_current_configuration()` al conectar CDC1 desde la GUI).
+
+### API de configuración por CDC1 — comandos de texto
+
+Implementados en `handle_config_command()` (`src/usb_manager.cpp`). Todos responden `OK` o
+`ERROR: <motivo>` (excepto `RREG`/`ID` que devuelven el valor leído). Los comandos que modifican un
+subconjunto de bits de un registro compartido (p. ej. `CHnSET`) hacen read-modify-write vía
+`ads1298::readModifyWriteRegister()`, preservando el resto de los campos.
+
+Cada comando recibido por CDC1 se loguea primero por CDC_DEBUG (CDC0) como
+`"[CFG] comando recibido: <línea cruda>"`, **antes** de tokenizarlo (porque `strtok()` muta el
+buffer insertando terminadores nulos en los separadores) — sirve para confirmar en tiempo real qué
+API se está ejecutando realmente al ir probando contra hardware.
+
+| Comando | Registro(s)/bits afectados | Efecto |
+|---|---|---|
+| `ID` / `READ_ID` | `REG_ID` | Lee el registro ID del ADS1298 |
+| `RREG <addr_hex>` | cualquiera | Lee un registro crudo (escape hatch) |
+| `WREG <addr_hex> <valor_hex>` | cualquiera | Escribe un registro crudo (escape hatch) |
+| `GAIN <ch 1-8> <1\|2\|3\|4\|6\|8\|12>` | `CHnSET.GAIN[2:0]` | Ganancia del PGA del canal |
+| `CHPOWER <ch 1-8> <ON\|OFF>` | `CHnSET.PDn` (+ `MUX`→`001` al apagar) | Enciende/apaga la lectura de un canal |
+| `MODE <HR\|LP>` | `CONFIG1.HR` | High-Resolution vs Low-Power (ancho de banda del filtro digital) |
+| `RLD <ON\|OFF>` | `CONFIG3.PD_RLD` | Enciende/apaga el amplificador RLD (pese al nombre `PD_`, 1=habilitado) |
+| `RLD_CH <ch 1-8> <P\|N> <0\|1>` | `RLD_SENSP`/`RLD_SENSN` | Incluye/excluye el electrodo del promedio de RLD |
+| `TESTSIG <ON\|OFF>` | `CONFIG2.INT_TEST` | Habilita la señal de test interna |
+| `TESTSIG_AMP <1\|2>` | `CONFIG2.TEST_AMP` | Amplitud de la señal de test |
+| `TESTSIG_FREQ <SLOW\|FAST\|DC>` | `CONFIG2.TEST_FREQ[1:0]` | Frecuencia de la señal de test |
+| `MUX <ch 1-8> <NORMAL\|SHORT\|RLD_MEAS\|SUPPLY\|TEMP\|TEST\|RLD_DRP\|RLD_DRN>` | `CHnSET.MUX[2:0]` | Fuente de entrada del canal (incluye rutear la test signal) |
+| `LOFF_CH <ch 1-8> <P\|N> <0\|1>` | `LOFF_SENSP`/`LOFF_SENSN` | Habilita lead-off detection en ese lado del canal |
+| `LOFF_MODE <DC\|AC>` | `LOFF.FLEAD_OFF[1:0]` | Tipo de excitación de lead-off |
+| `LOFF_TYPE <RESISTOR\|CURRENT>` | `LOFF.VLEAD_OFF_EN` | Pullup/pulldown vs. fuente de corriente |
+| `LOFF_CURRENT <6\|12\|18\|24>` | `LOFF.ILEAD_OFF[1:0]` | Magnitud de corriente de lead-off (nA) |
+| `LOFF_THRESHOLD <0-7>` | `LOFF.COMP_TH[2:0]` | Código crudo del umbral del comparador (ver Tabla LOFF del datasheet para el % correspondiente) |
+| `START` / `STOP` | pin START del ADS1298 | Arranca/detiene la adquisición en caliente |
+
+Cualquier otro texto recibido por CDC1 responde `OK` (comportamiento histórico, sin cambios).
+
 ## Software / Firmware
 
 ### Estructura de archivos
 
-- `src/EMG.cpp` — `main()`. Inicializa USB, inicializa/reset ADS1298, lee ID, imprime por debug,
-  loop de `emg_usb_task()`.
-- `inc/ads1298.h` / `src/ads1298.cpp` — driver del ADS1298 (SPI, comandos, registros).
-- `inc/usb_manager.h` / `src/usb_manager.cpp` — capa sobre TinyUSB para gestionar los 7 CDC.
+- `src/EMG.cpp` — `main()`. Inicializa USB, inicializa/reset ADS1298, configura el data rate por
+  defecto (8 kSPS), lanza el core 1 (`acquisition_core1_entry`) y deja el loop principal en
+  `emg_usb_task()`.
+- `inc/ads1298.h` / `src/ads1298.cpp` — driver del ADS1298 (SPI, comandos, registros, mutex,
+  `readDataFrame`, helpers de read-modify-write y de extracción del status word).
+- `inc/acquisition.h` / `src/acquisition.cpp` — entry point del core 1 (loop de polling de DRDY +
+  lectura SPI + llenado de colas).
+- `inc/usb_manager.h` / `src/usb_manager.cpp` — capa sobre TinyUSB para gestionar los 7 CDC: banner
+  de bienvenida, colas de adquisición, drenado de colas hacia USB, y la API de configuración de
+  CDC1 (tabla de comandos arriba).
 - `src/usb_descriptors.c` — descriptores USB (device, config, strings) para 7 interfaces CDC.
 - `inc/tusb_config.h` — configuración de TinyUSB (`CFG_TUD_CDC = 7`, buffers RX/TX de 64 bytes).
 - `CMakeLists.txt` — build con Pico SDK 2.2.0, librerías `pico_stdlib`, `hardware_spi`,
-  `tinyusb_device`, `tinyusb_board`. `pico_enable_stdio_usb/uart` están **desactivados** porque el
-  proyecto usa su propio CDC de TinyUSB en vez del stdio estándar del SDK.
+  `pico_multicore`, `tinyusb_device`, `tinyusb_board`. `pico_enable_stdio_usb/uart` están
+  **desactivados** porque el proyecto usa su propio CDC de TinyUSB en vez del stdio estándar del SDK.
 
 ### Mapeo de canales USB CDC (definido en `inc/usb_manager.h`)
 
 | CDC # | Uso |
 |---|---|
 | 0 | Debug (mensajes de texto, solo lectura desde la PC) |
-| 1 | Configuración full-duplex (comandos PC→Pico y respuestas) |
-| 2 | Datos ADS canales 1 y 2 |
-| 3 | Datos ADS canales 3 y 4 |
-| 4 | Datos ADS canales 5 y 6 |
-| 5 | Datos ADS canales 7 y 8 |
-| 6 | RLD (right leg drive) |
-
-Es decir, 2 canales físicos del ADS1298 por cada interfaz CDC de datos (2,3,4,5), tal como pidió el
-usuario. Actualmente CDC2-5 y CDC6 solo responden "OK" a cualquier byte recibido (placeholder,
-`tud_cdc_rx_cb` en `usb_manager.cpp`); todavía no envían datos de conversión reales.
+| 1 | Configuración full-duplex (comandos PC→Pico y respuestas, ver tabla de comandos arriba) |
+| 2 | Datos ADS canales 1 y 2 (streaming binario, 7 bytes/trama) |
+| 3 | Datos ADS canales 3 y 4 (streaming binario, 7 bytes/trama) |
+| 4 | Datos ADS canales 5 y 6 (streaming binario, 7 bytes/trama) |
+| 5 | Datos ADS canales 7 y 8 (streaming binario, 7 bytes/trama) |
+| 6 | RLD / lead-off status (streaming binario, 3 bytes/trama) |
 
 Cada CDC tiene su propio endpoint de notificación, IN y OUT (ver `usb_descriptors.c`), VID/PID
 `0xCafe`/`0x4000|...`, fabricante "Raspberry Pi", producto "EMG ADS1298".
@@ -155,17 +286,150 @@ Cada CDC tiene su propio endpoint de notificación, IN y OUT (ver `usb_descripto
 
 ## Herramienta PC: `emg_multicdc_gui.py`
 
-GUI de escritorio (PyQt6 + pyserial) para monitorear y probar los 7 CDC del firmware desde la PC.
-Requisitos: `pip install pyqt6 pyserial`. Uso: `python emg_multicdc_gui.py`.
+GUI de escritorio (PyQt6 + pyserial + pyqtgraph + numpy) para monitorear, visualizar en tiempo real
+y configurar los 7 CDC del firmware desde la PC.
+Requisitos: `pip install pyqt6 pyserial pyqtgraph numpy`. Uso: `python emg_multicdc_gui.py`. El plan
+de diseño de este cambio (visualización binaria + panel de configuración) quedó guardado en
+`docs/plan_gui_streaming_config.md`.
 
 ### Qué hace
 
-- Un panel (`CdcPanel`) por cada uno de los 7 CDC (`CDC_NAMES`), cada uno con: estado de conexión,
-  área de texto de recepción, campo de envío de texto y botones enviar/limpiar.
+- Ventana con pestañas (`QTabWidget`): **"Monitor"** y **"Configuración"** (`ConfigPanel`, en
+  `QScrollArea`, con los controles que arman y mandan los comandos de la API de CDC1). El bloque
+  superior (selección de puertos, baudrate, botones de conectar/detectar, pantalla completa) es
+  común a ambas pestañas.
+- La ventana arranca maximizada (`showMaximized()`); botón **"Pantalla completa (F11)"** (o tecla
+  `F11`) alterna `showFullScreen()`/`showNormal()` vía `MainWindow.toggle_fullscreen()`.
+- Pestaña **"Monitor"** (envuelta en `QScrollArea` para poder scrollear si no entra todo en
+  pantalla):
+  - Fila superior compacta con `CdcPanel` de **CDC0**/**CDC1** (texto por línea, estado de conexión,
+    input + botones enviar/limpiar) y `RldStatusPanel` de **CDC6** (8 indicadores para
+    `LOFF_STATP` + 8 para `LOFF_STATN`, verde = electrodo OK / rojo = desconectado).
+  - Caja **"Canales visibles"**: un checkbox por canal físico (1-8), todos tildados por defecto.
+  - Grilla de plots (`SingleChannelPlot`, uno por canal físico, no por CDC): `channel_grid_container`
+    ocupa todo el espacio restante (`stretch=1`) y se reparte dinámicamente entre los canales
+    tildados vía `MainWindow._rebuild_channel_grid()` + `best_grid_shape(n)` — 1 canal tildado ocupa
+    toda el área, 4 canales la dividen 2×2, 8 canales 2×4, etc. (elige la forma sin huecos y más
+    cuadrada, prefiriendo más columnas que filas en empate). Los 8 `SingleChannelPlot` **siempre**
+    existen y siguen recibiendo datos (`append_batch`) aunque estén ocultos — destildar un canal
+    solo lo saca del grid (`layout.takeAt` + `hide()`) y lo excluye de `refresh_plots()`, no corta el
+    streaming; al volver a tildarlo se re-inserta con los datos ya bufferizados.
+  - Cada `SingleChannelPlot` tiene el eje Y en **mV** con autoescala (`enableAutoRange(axis="y")` de
+    pyqtgraph) para acomodarse automáticamente a la amplitud real de cada señal; se desactiva sola si
+    el usuario hace zoom/pan manual sobre ese plot.
+  - `MainWindow.pair_channels` mapea cada nombre de CDC de datos a su par de canales físicos
+    (`{"DATA CH1-CH2 CDC2": (1, 2), ...}`), usado para rutear los batches de `poll_process_queues` y
+    los cambios de estado de conexión (`_update_connection_status`) al `SingleChannelPlot` de cada
+    canal individual.
+- **`ConfigPanel`** (pestaña "Configuración"): tabla por canal (1-8) con combos/checkboxes para
+  `GAIN`, `CHPOWER`, `MUX`, `LOFF_CH` (P/N), `RLD_CH` (P/N); controles globales para `MODE`, `RLD`,
+  `TESTSIG`/`TESTSIG_AMP`/`TESTSIG_FREQ`, `LOFF_MODE`/`LOFF_TYPE`/`LOFF_CURRENT`/`LOFF_THRESHOLD`, y
+  botones `START`/`STOP`. Cada control manda su comando por CDC1 apenas cambia (sin botón
+  "aplicar"); las respuestas (`OK`/`ERROR: ...`) se ven en el panel de texto de CDC1 en "Monitor".
+  `RREG`/`WREG` crudos se siguen escribiendo a mano ahí (no tienen controles dedicados). El combo de
+  `GAIN` de cada canal además emite `ConfigPanel.gain_changed(canal, ganancia)`, que
+  `MainWindow.on_gain_changed()` propaga al `SingleChannelPlot` de ese canal para que la conversión
+  a mV use la ganancia real configurada.
 - Un combo de asignación de puerto COM por CDC + spinbox de baudrate + botones "Buscar puertos",
-  "Auto-detectar CDC", "Conectar seleccionados" y "Desconectar todo".
-- Cada conexión serie corre en su propio `QThread`/`SerialWorker` (lectura por líneas `\n`,
-  no bloqueante para la UI).
+  "Auto-detectar CDC", "Conectar seleccionados" y "Desconectar todo" (sin cambios de comportamiento).
+
+### Lectura automática de la configuración real del ADS1298 al conectar
+
+Al conectar CDC1 (ya sea al hacer clic en "Conectar seleccionados" o justo después de que el hilo
+de `SerialWorker` confirme la conexión), `MainWindow.read_current_configuration()` manda
+automáticamente un `RREG` por cada registro relevante (`CONFIG_READBACK_REGISTERS`: CONFIG1-3, LOFF,
+CH1SET..CH8SET, RLD_SENSP/N, LOFF_SENSP/N) para que la pestaña "Configuración" refleje cómo estaba
+configurado el chip realmente, en vez de asumir los valores por defecto de fábrica. También hay un
+botón **"Releer configuración actual del ADS1298"** en esa pestaña para repetir la lectura a mano
+(por si se cambió algo por `WREG` crudo o se perdió alguna respuesta).
+
+- Las respuestas ("`REG XX=YY`", formato de `handle_config_command()` en `usb_manager.cpp`) se
+  interceptan en `MainWindow.on_data_received()` con la regex `_REG_RESPONSE_RE` y se despachan a
+  `ConfigPanel.apply_register(addr, value)`, que decodifica los bits (mismos mapeos que
+  `inc/ads1298.h`: `GAIN_CODE_TO_VALUE`, `MUX_MODES`, `TEST_FREQ_CODE_TO_TEXT`,
+  `LOFF_CURRENT_CODE_TO_TEXT`, `LOFF_MODE_CODE_TO_TEXT`) y actualiza el combo/checkbox
+  correspondiente con `blockSignals(True)` para **no** volver a mandar el comando al ADS1298 (evita
+  un loop de reconfiguración al sincronizar el estado).
+- Si el usuario cambia algo por `RREG`/`WREG` crudo en vez de por los controles de `ConfigPanel`,
+  el GUI también se entera y actualiza los controles (porque escucha cualquier respuesta `REG XX=YY`
+  que pase por CDC1, no solo las disparadas por `read_current_configuration()`).
+
+### Conversión código ADC → mV
+
+`code_to_millivolts(codes, gain)` en `emg_multicdc_gui.py` implementa
+`Vin(mV) = codigo * VREF(2.4 V) * 1000 / (Gain * (2^23 - 1))`, según la Tabla 13 del datasheet
+("Ideal Output Code versus Input Signal") y `ads1298::gainToCode()` del firmware. Notas importantes:
+
+- **VREF se asume fijo en 2.4 V** (referencia interna por defecto, `CONFIG3.VREF_4V=0`) — la API de
+  CDC1 no expone ningún comando para cambiar la referencia, así que no hay forma de que el GUI se
+  entere si se cambiara por `RREG`/`WREG` crudo.
+- Cada `SingleChannelPlot` (un canal físico por widget, ver "Qué hace" más abajo) guarda su propia
+  `gain` (default 6, igual que el reset de `CHnSET` y el valor inicial del combo `GAIN` en
+  `ConfigPanel`) y la actualiza vía `set_gain()` cuando `MainWindow.on_gain_changed()` recibe
+  `gain_changed` desde `ConfigPanel`. Si el usuario cambia la ganancia por `WREG` directo en vez del
+  combo de `ConfigPanel`, el GUI no se entera y la conversión a mV quedará mal hasta que se use el
+  combo (o se lea de nuevo la configuración, ver botón "Releer configuración actual").
+- La conversión se aplica en `refresh()` (al momento de dibujar), no al ingerir los datos: si la
+  ganancia cambió hace poco, las muestras más viejas que quedan en el buffer circular se dibujan con
+  la ganancia *actual*, no con la que tenían en el momento de la captura — aproximación aceptable
+  para visualización, no para medición de precisión (ver "Próximos pasos").
+
+**Nota histórica — amplitud real de la test signal interna:** la test signal interna del ADS1298
+(`TESTSIG ON`) es de amplitud **muy chica**: `CONFIG2.TEST_AMP` da ±1 mV (código 0) o ±2 mV (código
+1) — fórmula `±(VREFP - VREFN)/2400 V` del datasheet —, **antes** de dividir por la ganancia en
+`code_to_millivolts()` (la ganancia no cambia la amplitud física de la señal de test, solo cuántos
+códigos ADC la representan). Es decir, en el plot **siempre** se ve una onda cuadrada de ~1-2 mV de
+amplitud, sea cual sea la ganancia configurada — esto es correcto, no un bug. Confirmado
+independientemente en el foro de TI (varios usuarios reportan la misma amplitud minúscula y el mismo
+síntoma de "spikes que resultan ser datos corruptos de lecturas mal sincronizadas", no la señal
+real): [ADS1298: Internal Test Signal](https://e2e.ti.com/support/data-converters-group/data-converters/f/data-converters-forum/817546/ads1298-internal-test-signal).
+El bug real que sí corregimos fue el falso resincronismo de `extract_frames()` (ver "Formato de
+trama binaria decodificado" más abajo), que producía esos picos de cientos de mV y, al ser mucho
+más grandes que la señal real, dominaban el autoescalado del eje Y y tapaban la onda cuadrada
+verdadera.
+
+### Arquitectura de conexión: hilo (texto) vs proceso (binario)
+
+CDC0/CDC1 (texto, interactivo, baja tasa) siguen usando `QThread` + `SerialWorker` como antes — ahí
+alcanza con multitasking cooperativo.
+
+CDC2-6 (streaming binario continuo, hasta 8 kSPS × 4 canales de datos) corren cada uno en su
+**propio proceso del sistema operativo** (`multiprocessing.Process`), para lograr paralelismo real
+entre canales sin competir por el GIL de Python ni con el hilo de la UI:
+
+- `serial_process_worker(name, port, baudrate, frame_mode, out_queue, stop_event)` — función de
+  **módulo** (no un método; así `multiprocessing` la puede picklear con el método `spawn` que usa
+  Windows por defecto). Abre el puerto, busca el byte de sync `0xAA` con `extract_frames()`, decodifica
+  tramas fijas de 7 bytes (`frame_mode="data"`, canales A/B de 24 bits con signo vía
+  `decode_data_frame`/`decode_be24_signed`) o de 3 bytes (`frame_mode="rld"`, `decode_rld_frame`), y
+  manda los batches ya decodificados por `out_queue` (`multiprocessing.Queue`) cada ~30 ms como
+  `("frame", array_a, array_b)` / `("rld", array_a, array_b)`, y los cambios de estado como
+  `("status", connected, mensaje)`. Corta el loop y cierra el puerto cuando `stop_event.is_set()`.
+- `MainWindow` tiene un único `QTimer` (`poll_process_queues`, ~30 Hz) que drena sin bloquear
+  (`queue.get_nowait()`) todas las colas activas y despacha los batches, vía `pair_channels`, al
+  `SingleChannelPlot` de cada canal físico (o a `RldStatusPanel` para CDC6). Un segundo `QTimer`
+  separado (`refresh_plots`, ~30 FPS) redibuja solo los plots de los canales tildados en "Canales
+  visibles", desacoplando la tasa de llegada de datos de la tasa de refresco de pantalla.
+- `ThreadConnection` (CDC0/CDC1) y `ProcessConnection` (CDC2-6) son wrappers con la misma interfaz
+  mínima (`.port`, `.write_line()`, `.stop()`) guardados en `MainWindow.connections`, para que
+  `connect_selected`/`disconnect_all`/`disconnect_one`/`auto_detect_ports` no dupliquen lógica según
+  el tipo de conexión.
+- Verificación en el Administrador de tareas de Windows: con los 4 CDC de datos conectados deberían
+  verse varios procesos `python.exe` adicionales (uno por proceso de `multiprocessing.Process`).
+
+### Formato de trama binaria decodificado (debe coincidir con el firmware)
+
+Ver también CLAUDE.md → "Formato de trama binaria por USB" (lado firmware). CDC2-5: `FRAME_SYNC_BYTE
+(0xAA)` + 3 bytes canal A + 3 bytes canal B, MSB primero, complemento a 2. CDC6: `0xAA` +
+`LOFF_STATP` + `LOFF_STATN`.
+
+`extract_frames()` valida, antes de aceptar una trama candidata, que el byte donde debería estar el
+sync de la *trama siguiente* (`buffer[frame_size]`) también sea `0xAA`; si no lo es, descarta solo
+ese byte y reintenta con el próximo candidato (en vez de aceptar la trama a ciegas). Esto corrige un
+bug real observado en hardware con la test signal interna: como su amplitud real es de ~1-2 mV (ver
+más abajo), la mayoría de los bytes de canal son casi cero, y un byte de dato real que valga `0xAA`
+por casualidad se confundía con el sync, produciendo muestras absurdas (picos de cientos de mV) que
+además dominaban el autoescalado del eje Y y tapaban la señal real (ver "Nota histórica" abajo).
 
 ### Auto-detección de puertos COM (botón "Auto-detectar CDC")
 
@@ -217,18 +481,29 @@ COM9→CDC3, COM10→CDC0), confirmando que la detección por banner es necesari
 
 ## Próximos pasos sugeridos (a partir de lo que falta)
 
-1. Implementar el loop de streaming: usar DRDY (o RDATAC) para leer los 8 canales + status word por
-   SPI y despachar cada par de canales al CDC correspondiente (2-5), y el estado RLD/lead-off al
-   CDC6.
-2. Definir un protocolo binario o de texto para CDC1 que permita configurar registros del ADS1298
-   (ganancia por canal, data rate, referencia, RLD, lead-off) en tiempo real.
-3. Considerar mover a modo RDATAC continuo con IRQ en DRDY en lugar de polling, para no bloquear
-   `emg_usb_task()`.
-4. Definir el formato de los datos que se envían por los CDC de datos (¿24 bits crudos? ¿escalados
-   a mV? ¿con timestamp?) — pendiente de decisión de diseño.
-5. En `emg_multicdc_gui.py`: una vez que el firmware transmita datos binarios reales de EMG por los
-   CDC 2-5, la lectura por líneas de texto (`\n`) de `SerialWorker` dejará de servir; habrá que
-   definir un framing binario (o mantener texto solo para debug/config y binario para datos) y
-   graficar las señales (por ejemplo con pyqtgraph) en vez de solo mostrar texto.
-6. Mover `identify_cdc_index`/auto-detección a un hilo (`QThread`) en vez de bloquear la UI con
+1. **Validar en hardware la nueva arquitectura de streaming**, en el orden acordado (ahora se puede
+   hacer directamente con `emg_multicdc_gui.py`, que ya decodifica y grafica los frames binarios):
+   1. Test signals internas: `TESTSIG ON` + `MUX <ch> TEST` desde la pestaña "Configuración",
+      confirmar la forma de onda esperada (cuadrada, con la amplitud/frecuencia configurada) en el
+      plot del CDC de datos correspondiente.
+   2. Señal continua/DC externa conocida por cada par `INxP`/`INxN`, verificar el valor digital
+      esperado según `GAIN` y la referencia de voltaje.
+   3. Generador de señales (AC realista), confirmar la cadena completa SPI→USB en condiciones
+      dinámicas a 8 kSPS sostenido, sin pérdida de muestras ni desincronización del marcador `0xAA`
+      (si se pierde sync se nota como un salto/glitch puntual en el plot).
+   - **Nota importante:** esto todavía no se probó contra la placa física con el firmware nuevo
+     flasheado — falta esa validación en hardware real.
+2. Evaluar si conviene throttlear el envío de CDC6 (RLD/lead-off) a una fracción de la tasa de
+   muestreo, ya que ese estado cambia mucho más lento que la señal EMG y hoy se manda a la misma
+   cadencia que los datos.
+3. ~~Conversión a mV en `SingleChannelPlot`~~ — hecho (`code_to_millivolts()`, ver sección
+   "Conversión código ADC → mV"). Sigue pendiente: si se agrega un comando para cambiar `VREF_4V` a
+   la API de CDC1, hay que actualizar `ADS1298_VREF_VOLTS` o trackearlo igual que la ganancia.
+4. Mover `identify_cdc_index`/auto-detección a un hilo (`QThread`) en vez de bloquear la UI con
    `processEvents()`, sobre todo si se agregan más CDC o el escaneo se vuelve más lento.
+5. Considerar mover de polling de DRDY a IRQ en el core 1 si el consumo de CPU/energía del polling
+   cerrado resulta un problema (hoy es polling puro por simplicidad, ver `acquisition_core1_entry()`).
+6. `extract_frames()` en el GUI se resincroniza buscando el próximo `0xAA`, pero no tiene ninguna
+   verificación adicional (CRC, contador de secuencia); un `0xAA` que aparezca dentro de un valor de
+   canal real puede producir una muestra corrupta puntual — aceptable para una herramienta de
+   visualización, pero a tener en cuenta si se necesita integridad de datos garantizada.

@@ -32,4 +32,15 @@ void emg_usb_write(uint8_t itf, const char *msg);
 void emg_usb_write_line(uint8_t itf, const char *msg);
 void emg_usb_write_debug(const char *msg);
 
+// ==================================================
+// API de adquisición (llamadas desde el core 1)
+// ==================================================
+// El core de adquisición nunca debe llamar funciones tud_*; en cambio,
+// empuja las muestras a colas lock-free que el core 0 drena en
+// emg_usb_task() y envía por el CDC correspondiente. pair_index va de 0 a 3
+// y corresponde a CDC_DATA_CH12..CDC_DATA_CH78 en ese orden.
+
+void emg_usb_push_channel_pair(uint8_t pair_index, int32_t ch_a, int32_t ch_b);
+void emg_usb_push_rld_status(uint8_t loff_statp, uint8_t loff_statn);
+
 #endif

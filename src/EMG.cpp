@@ -1,6 +1,9 @@
 #include <stdio.h>
 
 #include "pico/stdlib.h"
+#include "pico/multicore.h"
+
+#include "acquisition.h"
 #include "ads1298.h"
 #include "usb_manager.h"
 
@@ -13,6 +16,28 @@
 // DOUT GP16, CS GP17, SCLK GP18, DIN GP19,
 // DRDY GP20, RESET GP21, START GP22, PWDN GP26.
 ads1298 ads;
+
+// CONFIG1 de arranque: HR=1 (alta resolución), DR=010 (8 kSPS en modo HR).
+// Este es el data rate máximo soportado por el firmware (ver validación de
+// throughput USB en CLAUDE.md); el comando MODE por CDC1 solo alterna
+// HR/LP sin tocar este límite de DR.
+static constexpr uint8_t DEFAULT_CONFIG1 = ads1298::CONFIG1_HR_BIT | 0x02;
+
+// CONFIG3 de arranque: bit reservado (0x40, debe estar siempre en 1 según
+// el datasheet) + PD_REFBUF=1 para habilitar el buffer de referencia
+// interno de 2.4V. Sin este bit el reset de fábrica deja la referencia
+// apagada (VREFP sin excitar), lo que invalida cualquier medición que
+// dependa de ella (incluida la test signal interna).
+static constexpr uint8_t DEFAULT_CONFIG3 = 0x40 | ads1298::CONFIG3_PD_REFBUF_BIT;
+
+static void configure_ads_defaults()
+{
+    ads.lock();
+    ads.sendCommand(ads1298::CMD_SDATAC);
+    ads.writeRegister(ads1298::REG_CONFIG1, DEFAULT_CONFIG1);
+    ads.writeRegister(ads1298::REG_CONFIG3, DEFAULT_CONFIG3);
+    ads.unlock();
+}
 
 // ==================================================
 // Programa principal
@@ -42,8 +67,26 @@ int main(void)
         emg_usb_write_line(CDC_DEBUG, "ERROR: no se obtuvo el ID esperado. Valor esperado: 0x92");
     }
 
+    configure_ads_defaults();
+
+    // El buffer de referencia interno recién habilitado (PD_REFBUF en
+    // CONFIG3) necesita un tiempo de establecimiento antes de que VREFP sea
+    // confiable; sin esta espera las primeras conversiones (y cualquier
+    // medición que dependa de la referencia, como la test signal interna)
+    // pueden salir con offset/amplitud incorrectos. Ver datasheet, sección
+    // de secuencia de encendido, para ajustar este valor si hiciera falta.
+    sleep_ms(150);
+
+    ads.startConversions();
+
+    // El core 1 hace polling de DRDY y lee los datos del ADS1298 por SPI;
+    // el core 0 (este) se dedica exclusivamente a TinyUSB: drenar las colas
+    // de datos hacia los CDC de salida y atender los comandos de
+    // configuración que llegan por CDC1.
+    acquisition_init(&ads);
+    multicore_launch_core1(acquisition_core1_entry);
+
     while (true) {
-        // TinyUSB debe ejecutarse constantemente.
         emg_usb_task();
     }
 
