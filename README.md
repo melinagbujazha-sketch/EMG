@@ -101,12 +101,18 @@ pip install pyqt6 pyserial pyqtgraph numpy scipy
 
 3. En la pestaña **"Monitor"**, tocar el botón **"Conectar equipo"**: la GUI detecta y conecta
    automáticamente las 7 interfaces del firmware, sin necesidad de elegir puertos COM a mano.
-4. Desde la sidebar (izquierda) se eligen los canales a visualizar, la ganancia por canal, los
-   filtros (notch/pasaaltos/pasabajos) y el RLD/lead-off. Los plots de los canales tildados ocupan
-   el resto de la pantalla.
-5. La pestaña **"Señales de prueba"** permite activar la test signal interna del ADS1298 para
+4. Desde la sidebar (izquierda) se eligen los canales a visualizar, la ganancia por canal, la
+   escala de los plots (automática o manual, en s/ms y mV/µV/V), los filtros
+   (notch/pasaaltos/pasabajos) y el RLD/lead-off. Los plots de los canales tildados ocupan el resto
+   de la pantalla sin scrollbar (eje X en segundos): con 1-3 canales se apilan en una sola columna;
+   con 4-8 se reparten en dos columnas lado a lado, priorizando siempre ver más escala horizontal
+   (tiempo) que vertical.
+5. En la barra superior, junto a "Conectar equipo"/"Desconectar equipo", el botón
+   **"Iniciar grabación"** guarda a un archivo CSV los canales que estén tildados en ese momento
+   (pide elegir la carpeta de destino); **"Detener grabación"** cierra el archivo.
+6. La pestaña **"Señales de prueba"** permite activar la test signal interna del ADS1298 para
    validar que la cadena SPI→USB funciona antes de medir una señal real.
-6. La pestaña **"Avanzado"** expone el detalle técnico (asignación manual de puertos COM por CDC,
+7. La pestaña **"Avanzado"** expone el detalle técnico (asignación manual de puertos COM por CDC,
    texto crudo de configuración, lectura/escritura directa de registros, estado completo de
    lead-off/RLD por electrodo) — pensada para debug, no para el uso clínico normal.
 

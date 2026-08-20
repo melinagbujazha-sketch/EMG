@@ -37,13 +37,21 @@ Streaming binario (CDC2-6) y arquitectura multicore:
     que un QTimer drena periódicamente sin bloquear el hilo de la UI.
 
 Interfaz clínica (3 pestañas):
+    Barra superior (visible en las 3 pestañas): "Conectar equipo"/
+    "Desconectar equipo" (sin exponer CDC ni puertos COM al usuario
+    clínico), "Iniciar grabación"/"Detener grabación" a CSV, y pantalla
+    completa.
+
     "Monitor" es la pestaña principal: una sidebar a la izquierda (~20% del
-    ancho, selección de canales visibles + ganancia por canal, filtros de
-    software y toggles simples de RLD/lead-off) y a la derecha la grilla de
-    plots de los canales tildados, repartiendo el 80% restante del espacio
-    entre ellos (ver SingleChannelPlot/best_grid_shape). La conexión con el
-    equipo es un solo botón ("Conectar equipo"), sin exponer CDC ni puertos
-    COM al usuario clínico.
+    ancho, selección de canales visibles + ganancia por canal, escala de
+    los plots, filtros de software y toggles simples de RLD/lead-off) y a
+    la derecha el área de plots de los canales tildados, ocupando el 80%
+    restante del espacio **sin scrollbar** (siempre se reparten para entrar
+    en el espacio disponible, ver MainWindow._rebuild_channel_grid): con
+    1-3 canales tildados se apilan en una sola columna; con 4-8 se separan
+    en dos columnas lado a lado (ceil(n/2) a la izquierda, floor(n/2) a la
+    derecha), cada una apilada por su cuenta. Siempre se prioriza ver más
+    escala horizontal (tiempo) que vertical.
 
     "Señales de prueba" deja activar la test signal interna del ADS1298
     (TESTSIG/AMP/FREQ) y enrutarla a los canales elegidos (MUX TEST/NORMAL
@@ -63,10 +71,31 @@ Filtros de señal (software, no firmware):
     visible completa en cada redibujado, solo a los canales actualmente
     visibles. No requieren tocar el firmware ni el ADS1298; la ganancia, RLD
     y lead-off sí son comandos reales de CDC1 y siguen aplicándose en el chip.
+
+Escala de los plots:
+    Cada SingleChannelPlot autoescala ambos ejes por defecto (pyqtgraph
+    autorange). La sidebar "Escala de los plots" permite pasar a modo
+    manual: un valor + unidad para el eje X (ventana de tiempo mostrada, en
+    s o ms) y para el eje Y (rango simétrico ±valor, en mV/µV/V). Ver
+    MainWindow._on_scale_changed / SingleChannelPlot.set_scale_mode.
+
+Grabación a CSV:
+    Los botones "Iniciar grabación"/"Detener grabación" de la barra
+    superior graban a un CSV "tidy" (columnas tiempo_s, canal, mV) los
+    canales tildados al momento de tocar "Iniciar grabación" (elige
+    carpeta de destino, nombre de archivo automático con timestamp). El
+    valor mV es la señal *filtrada* (mismo notch/pasaaltos/pasabajos de la
+    sidebar), aplicada muestra a muestra con estado persistente
+    (scipy.signal.sosfilt + sosfilt_zi) para que coincida con lo que se ve
+    en pantalla — a diferencia del sosfiltfilt de fase cero que usan los
+    plots, que solo tiene sentido sobre una ventana ya completa. Ver
+    MainWindow._start_recording/_stop_recording/_record_batch.
 """
 
+import csv
 import math
 import multiprocessing as mp
+import os
 import queue
 import re
 import sys
@@ -77,15 +106,15 @@ import numpy as np
 import pyqtgraph as pg
 import serial
 import serial.tools.list_ports
-from scipy.signal import butter, iirnotch, tf2sos, sosfiltfilt
+from scipy.signal import butter, iirnotch, tf2sos, sosfilt, sosfilt_zi, sosfiltfilt
 
 from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal, pyqtSlot, Qt
-from PyQt6.QtGui import QKeySequence, QShortcut
+from PyQt6.QtGui import QFont, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QMainWindow, QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QLabel, QComboBox, QCheckBox, QLineEdit,
-    QGroupBox, QGridLayout, QMessageBox, QSpinBox, QInputDialog,
-    QTabWidget, QScrollArea, QSplitter,
+    QGroupBox, QGridLayout, QMessageBox, QSpinBox, QDoubleSpinBox,
+    QInputDialog, QTabWidget, QScrollArea, QSplitter, QFileDialog,
 )
 
 
@@ -530,34 +559,15 @@ class CdcPanel(QGroupBox):
 # ==================================================
 
 
-def best_grid_shape(n: int):
-    """Elige (filas, columnas) para acomodar n widgets ocupando todo el
-    espacio disponible, priorizando (en orden): sin huecos vacíos, forma lo
-    más cuadrada posible, y preferir más columnas que filas si hay empate
-    (pantallas típicamente más anchas que altas)."""
-    if n <= 0:
-        return (1, 1)
-
-    best_cols, best_score = 1, None
-    for cols in range(1, n + 1):
-        rows = -(-n // cols)  # ceil(n / cols)
-        waste = rows * cols - n
-        score = (waste, abs(rows - cols), -cols)
-        if best_score is None or score < best_score:
-            best_score = score
-            best_cols = cols
-
-    rows = -(-n // best_cols)
-    return rows, best_cols
-
-
 class SingleChannelPlot(QGroupBox):
     """Panel de visualización en tiempo real para UN canal físico del
     ADS1298. Mantiene un buffer circular y se redibuja con un timer
     separado (ver MainWindow.refresh_plots), desacoplando la tasa de
     llegada de datos (hasta 8 kSPS) de la tasa de refresco de pantalla.
-    El eje Y se autoescala (pyqtgraph autorange) a la amplitud real de la
-    señal; el usuario puede desactivarlo haciendo zoom/pan manual."""
+    El eje X se expresa en segundos (tiempo transcurrido dentro de la
+    ventana visible, ver refresh()). Por defecto ambos ejes autoescalan
+    (pyqtgraph autorange); MainWindow._on_scale_changed puede fijarlos a un
+    rango manual (ver set_scale_mode)."""
 
     WINDOW_SECONDS = 4.0
     ASSUMED_SAMPLE_RATE = 8000  # cap de data rate del firmware, ver CLAUDE.md
@@ -567,19 +577,32 @@ class SingleChannelPlot(QGroupBox):
         self.channel = channel
         self.gain = DEFAULT_GAIN
         self.filter_sos = None
-        self.setMinimumHeight(150)
-        self.setMinimumWidth(200)
+        self.scale_auto = True
+        self.manual_x_seconds = self.WINDOW_SECONDS
+        self.manual_y_mv = 5.0
+        # Mínimos chicos y tipografía/interlineado reducidos: con hasta 4
+        # canales apilados en una misma columna (ver
+        # MainWindow._rebuild_channel_grid) tienen que entrar sin necesitar
+        # scrollbar.
+        self.setMinimumHeight(90)
+        self.setMinimumWidth(150)
+        self.setStyleSheet("QGroupBox { font-size: 10px; margin-top: 4px; }")
 
         self.status = QLabel("Desconectado")
-        self.status.setStyleSheet("color: red; font-weight: bold;")
+        self.status.setStyleSheet("color: red; font-weight: bold; font-size: 9px;")
 
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.setBackground("k")
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
-        self.plot_widget.setLabel("left", "mV")
-        self.plot_widget.setLabel("bottom", "Muestras")
+        self.plot_widget.setLabel("left", "mV", **{"font-size": "9px"})
+        self.plot_widget.setLabel("bottom", "Tiempo (s)", **{"font-size": "9px"})
+        tick_font = QFont()
+        tick_font.setPixelSize(9)
+        self.plot_widget.getAxis("left").setTickFont(tick_font)
+        self.plot_widget.getAxis("bottom").setTickFont(tick_font)
         self.plot_widget.setDownsampling(mode="peak")
         self.plot_widget.setClipToView(True)
+        self.plot_widget.enableAutoRange(axis="x", enable=True)
         self.plot_widget.enableAutoRange(axis="y", enable=True)
 
         self.curve = self.plot_widget.plot(pen=pg.mkPen("y", width=1))
@@ -590,6 +613,8 @@ class SingleChannelPlot(QGroupBox):
         self.filled = 0
 
         layout = QVBoxLayout()
+        layout.setContentsMargins(4, 2, 4, 4)
+        layout.setSpacing(2)
         layout.addWidget(self.status)
         layout.addWidget(self.plot_widget)
         self.setLayout(layout)
@@ -597,7 +622,7 @@ class SingleChannelPlot(QGroupBox):
     def set_connected(self, connected: bool, msg: str):
         self.status.setText(msg)
         color = "green" if connected else "red"
-        self.status.setStyleSheet(f"color: {color}; font-weight: bold;")
+        self.status.setStyleSheet(f"color: {color}; font-weight: bold; font-size: 9px;")
 
     def set_gain(self, gain: int):
         """Actualiza la ganancia usada para convertir a mV (llamado desde
@@ -610,6 +635,25 @@ class SingleChannelPlot(QGroupBox):
         aplicado a la señal antes de graficarla (ver
         MainWindow._on_filter_changed / build_filter_sos)."""
         self.filter_sos = sos
+
+    def set_scale_mode(self, auto: bool, x_seconds: float, y_mv: float):
+        """Fija el modo de escala de los ejes (ver sidebar "Escala de los
+        plots"). En modo automático (auto=True) se usa el autorango de
+        pyqtgraph como hasta ahora; en modo manual se fija el eje X a los
+        últimos x_seconds segundos (dentro de la ventana bufferizada de
+        WINDOW_SECONDS) y el eje Y al rango simétrico [-y_mv, y_mv]."""
+        self.scale_auto = auto
+        self.manual_x_seconds = x_seconds
+        self.manual_y_mv = y_mv
+
+        self.plot_widget.enableAutoRange(axis="x", enable=auto)
+        self.plot_widget.enableAutoRange(axis="y", enable=auto)
+
+        if not auto:
+            xmax = self.WINDOW_SECONDS
+            xmin = max(0.0, xmax - x_seconds)
+            self.plot_widget.setXRange(xmin, xmax, padding=0)
+            self.plot_widget.setYRange(-y_mv, y_mv, padding=0)
 
     def append_batch(self, values: np.ndarray):
         n = len(values)
@@ -663,7 +707,8 @@ class SingleChannelPlot(QGroupBox):
             except ValueError:
                 pass
 
-        self.curve.setData(mv_data)
+        time_axis = np.arange(len(mv_data)) / self.ASSUMED_SAMPLE_RATE
+        self.curve.setData(time_axis, mv_data)
 
 
 # ==================================================
@@ -1143,6 +1188,11 @@ class MainWindow(QMainWindow):
     _HPF_HZ = {"Apagado": None, "20 Hz": 20, "50 Hz": 50}
     _LPF_HZ = {"Apagado": None, "150 Hz": 150, "500 Hz": 500}
 
+    # Combos de unidad de la sidebar "Escala de los plots" -> factor de
+    # conversión a las unidades internas (segundos / mV).
+    _X_UNIT_TO_SECONDS = {"s": 1.0, "ms": 0.001}
+    _Y_UNIT_TO_MV = {"mV": 1.0, "µV": 0.001, "V": 1000.0}
+
     def __init__(self):
         super().__init__()
 
@@ -1158,6 +1208,14 @@ class MainWindow(QMainWindow):
         self.connections = {}     # name -> ThreadConnection | ProcessConnection
         self.port_combos = {}
         self.current_filter_sos = None  # sos vigente, aplicado a los canales visibles
+
+        # Estado de grabación a CSV (ver _build_recording_box / _start_recording).
+        self.recording_active = False
+        self.recording_channels = []       # canales tildados al iniciar la grabación
+        self.recording_file = None
+        self.recording_writer = None
+        self.recording_sample_counts = {}  # canal -> cantidad de muestras ya grabadas
+        self.recording_filter_state = {}   # canal -> (sos, zi) del filtro streaming (ver _record_batch)
 
         # Qué par de canales físicos entrega cada CDC de datos (ver
         # "Formato de trama binaria por USB" en CLAUDE.md).
@@ -1188,11 +1246,21 @@ class MainWindow(QMainWindow):
         self.disconnect_equipment_button = QPushButton("Desconectar equipo")
         self.equipment_status_label = QLabel("Equipo desconectado")
         self.equipment_status_label.setStyleSheet("color: red; font-weight: bold;")
+
+        self.start_recording_button = QPushButton("Iniciar grabación")
+        self.stop_recording_button = QPushButton("Detener grabación")
+        self.stop_recording_button.setEnabled(False)
+        self.recording_status_label = QLabel("Sin grabación")
+
         self.fullscreen_button = QPushButton("Pantalla completa (F11)")
 
         top.addWidget(self.connect_equipment_button)
         top.addWidget(self.disconnect_equipment_button)
         top.addWidget(self.equipment_status_label)
+        top.addSpacing(20)
+        top.addWidget(self.start_recording_button)
+        top.addWidget(self.stop_recording_button)
+        top.addWidget(self.recording_status_label)
         top.addStretch()
         top.addWidget(self.fullscreen_button)
 
@@ -1207,6 +1275,8 @@ class MainWindow(QMainWindow):
 
         self.connect_equipment_button.clicked.connect(self.connect_equipment)
         self.disconnect_equipment_button.clicked.connect(self.disconnect_all)
+        self.start_recording_button.clicked.connect(self._start_recording)
+        self.stop_recording_button.clicked.connect(self._stop_recording)
         self.fullscreen_button.clicked.connect(self.toggle_fullscreen)
         QShortcut(QKeySequence("F11"), self, activated=self.toggle_fullscreen)
 
@@ -1226,8 +1296,10 @@ class MainWindow(QMainWindow):
 
     def _build_monitor_tab(self) -> QWidget:
         """Pestaña principal: sidebar (~20% del ancho) con selección de
-        canales/ganancia, filtros y RLD/lead-off, más la grilla de plots de
-        los canales visibles ocupando el 80% restante (ver QSplitter)."""
+        canales/ganancia, filtros y RLD/lead-off, más el área de plots de
+        los canales visibles ocupando el 80% restante (ver QSplitter), sin
+        scrollbar: siempre se reparten para entrar en el espacio disponible
+        (ver _rebuild_channel_grid)."""
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
         sidebar_scroll = QScrollArea()
@@ -1241,8 +1313,13 @@ class MainWindow(QMainWindow):
         for ch in range(1, 9):
             self.channel_plots[ch] = SingleChannelPlot(ch)
 
+        # channel_grid es un QHBoxLayout con 1 o 2 "columnas" (QWidget con su
+        # propio QVBoxLayout interno), reconstruidas enteras en cada llamada
+        # a _rebuild_channel_grid según cuántos canales estén tildados.
         self.channel_grid_container = QWidget()
-        self.channel_grid = QGridLayout()
+        self.channel_grid = QHBoxLayout()
+        self.channel_grid.setContentsMargins(0, 0, 0, 0)
+        self.channel_grid.setSpacing(6)
         self.channel_grid_container.setLayout(self.channel_grid)
         splitter.addWidget(self.channel_grid_container)
 
@@ -1260,6 +1337,7 @@ class MainWindow(QMainWindow):
         sidebar.setLayout(layout)
 
         layout.addWidget(self._build_channel_box())
+        layout.addWidget(self._build_scale_box())
         layout.addWidget(self._build_filter_box())
         layout.addWidget(self._build_rld_leadoff_box())
         layout.addStretch()
@@ -1294,6 +1372,47 @@ class MainWindow(QMainWindow):
             self.channel_gain_combos[ch] = gain_combo
 
         box.setLayout(grid)
+        return box
+
+    def _build_scale_box(self) -> QGroupBox:
+        box = QGroupBox("Escala de los plots")
+        layout = QGridLayout()
+
+        layout.addWidget(QLabel("Modo:"), 0, 0)
+        self.scale_mode_combo = QComboBox()
+        self.scale_mode_combo.addItems(["Automática", "Manual"])
+        self.scale_mode_combo.currentTextChanged.connect(self._on_scale_changed)
+        layout.addWidget(self.scale_mode_combo, 0, 1, 1, 2)
+
+        layout.addWidget(QLabel("Eje X:"), 1, 0)
+        self.x_scale_spin = QDoubleSpinBox()
+        self.x_scale_spin.setRange(0.01, 60.0)
+        self.x_scale_spin.setDecimals(2)
+        self.x_scale_spin.setValue(SingleChannelPlot.WINDOW_SECONDS)
+        self.x_scale_spin.valueChanged.connect(self._on_scale_changed)
+        layout.addWidget(self.x_scale_spin, 1, 1)
+
+        self.x_scale_unit_combo = QComboBox()
+        self.x_scale_unit_combo.addItems(list(self._X_UNIT_TO_SECONDS.keys()))
+        self.x_scale_unit_combo.currentTextChanged.connect(self._on_scale_changed)
+        layout.addWidget(self.x_scale_unit_combo, 1, 2)
+
+        layout.addWidget(QLabel("Eje Y:"), 2, 0)
+        self.y_scale_spin = QDoubleSpinBox()
+        self.y_scale_spin.setRange(0.001, 10000.0)
+        self.y_scale_spin.setDecimals(3)
+        self.y_scale_spin.setValue(5.0)
+        self.y_scale_spin.valueChanged.connect(self._on_scale_changed)
+        layout.addWidget(self.y_scale_spin, 2, 1)
+
+        self.y_scale_unit_combo = QComboBox()
+        self.y_scale_unit_combo.addItems(list(self._Y_UNIT_TO_MV.keys()))
+        self.y_scale_unit_combo.currentTextChanged.connect(self._on_scale_changed)
+        layout.addWidget(self.y_scale_unit_combo, 2, 2)
+
+        box.setLayout(layout)
+
+        self._update_scale_controls_enabled()
         return box
 
     def _build_filter_box(self) -> QGroupBox:
@@ -1332,13 +1451,6 @@ class MainWindow(QMainWindow):
         self.leadoff_toggle = QCheckBox("Lead-off activo")
         self.leadoff_toggle.toggled.connect(self._on_leadoff_toggle)
         layout.addWidget(self.leadoff_toggle)
-
-        note = QLabel(
-            "La configuración fina (por electrodo, modo DC/AC, corriente y "
-            "umbral) está en la pestaña \"Avanzado\"."
-        )
-        note.setWordWrap(True)
-        layout.addWidget(note)
 
         box.setLayout(layout)
         return box
@@ -1425,7 +1537,7 @@ class MainWindow(QMainWindow):
         scroll.setWidget(advanced)
         return scroll
 
-    # ---- Filtros, ganancia y RLD/lead-off desde la sidebar ----
+    # ---- Filtros, escala, ganancia y RLD/lead-off desde la sidebar ----
 
     def _on_filter_changed(self, _value=None):
         notch = self._NOTCH_HZ[self.notch_combo.currentText()]
@@ -1437,6 +1549,27 @@ class MainWindow(QMainWindow):
         )
         for ch in self.visible_channels:
             self.channel_plots[ch].set_filter(self.current_filter_sos)
+
+    def _update_scale_controls_enabled(self):
+        manual = self.scale_mode_combo.currentText() == "Manual"
+        for widget in (
+            self.x_scale_spin, self.x_scale_unit_combo,
+            self.y_scale_spin, self.y_scale_unit_combo,
+        ):
+            widget.setEnabled(manual)
+
+    def _on_scale_changed(self, _value=None):
+        """Aplica el modo de escala (automática o manual) elegido en la
+        sidebar a los 8 SingleChannelPlot (no solo a los visibles: así, si
+        se tilda un canal nuevo más tarde, ya respeta la escala vigente)."""
+        self._update_scale_controls_enabled()
+
+        auto = self.scale_mode_combo.currentText() == "Automática"
+        x_seconds = self.x_scale_spin.value() * self._X_UNIT_TO_SECONDS[self.x_scale_unit_combo.currentText()]
+        y_mv = self.y_scale_spin.value() * self._Y_UNIT_TO_MV[self.y_scale_unit_combo.currentText()]
+
+        for plot in self.channel_plots.values():
+            plot.set_scale_mode(auto, x_seconds, y_mv)
 
     def _on_sidebar_gain_changed(self, channel: int, gain_text: str):
         self.send_config_command(f"GAIN {channel} {gain_text}")
@@ -1456,6 +1589,110 @@ class MainWindow(QMainWindow):
         for ch in range(1, 9):
             self.send_config_command(f"LOFF_CH {ch} P {value}")
             self.send_config_command(f"LOFF_CH {ch} N {value}")
+
+    # ---- Grabación a CSV ----
+
+    def _start_recording(self):
+        """Graba a un CSV "tidy" (columnas tiempo_s, canal, mV) los canales
+        que estén tildados en la sidebar en el momento de arrancar (si se
+        tildan/destildan canales después, la grabación sigue solo con los
+        que se eligieron al principio). El valor mV es la señal *filtrada*
+        (mismo notch/pasaaltos/pasabajos elegidos en la sidebar), aplicada
+        muestra a muestra con estado persistente (ver _record_batch) para
+        que la grabación coincida con lo que se ve en pantalla."""
+        if self.recording_active:
+            return
+
+        channels = list(self.visible_channels)
+        if not channels:
+            QMessageBox.warning(
+                self, "Grabación", "No hay canales visibles para grabar."
+            )
+            return
+
+        folder = QFileDialog.getExistingDirectory(
+            self, "Elegir carpeta de destino para la grabación"
+        )
+        if not folder:
+            return
+
+        # Milisegundos incluidos en el nombre para no pisar el archivo de una
+        # grabación anterior si se inicia otra dentro del mismo segundo.
+        timestamp = time.strftime('%Y%m%d_%H%M%S') + f"_{int(time.time() * 1000) % 1000:03d}"
+        filename = f"emg_recording_{timestamp}.csv"
+        path = os.path.join(folder, filename)
+
+        try:
+            self.recording_file = open(path, "w", newline="")
+        except OSError as e:
+            QMessageBox.warning(self, "Grabación", f"No se pudo crear el archivo:\n{e}")
+            return
+
+        self.recording_writer = csv.writer(self.recording_file)
+        self.recording_writer.writerow(["tiempo_s", "canal", "mV"])
+
+        self.recording_channels = channels
+        self.recording_sample_counts = {ch: 0 for ch in channels}
+        self.recording_filter_state = {}
+        self.recording_active = True
+
+        self.start_recording_button.setEnabled(False)
+        self.stop_recording_button.setEnabled(True)
+        self.recording_status_label.setText(
+            "Grabando canales " + ", ".join(str(c) for c in channels)
+        )
+        self.recording_status_label.setToolTip(path)
+
+    def _stop_recording(self):
+        if not self.recording_active:
+            return
+
+        self.recording_active = False
+        path = self.recording_file.name if self.recording_file else ""
+        if self.recording_file:
+            self.recording_file.close()
+        self.recording_file = None
+        self.recording_writer = None
+
+        self.start_recording_button.setEnabled(True)
+        self.stop_recording_button.setEnabled(False)
+        self.recording_status_label.setText("Grabación guardada")
+        self.recording_status_label.setToolTip(path)
+
+    def _record_batch(self, channel: int, raw_codes: np.ndarray):
+        """Convierte un batch crudo a mV con la ganancia vigente, le aplica
+        el mismo filtro elegido en la sidebar (si hay uno activo) de forma
+        continua muestra a muestra (scipy.signal.sosfilt con estado zi
+        persistente entre batches, a diferencia del sosfiltfilt de fase
+        cero que usan los plots), y escribe las filas al CSV. Se reinicia
+        el estado del filtro cada vez que cambia el sos vigente (nuevo
+        objeto devuelto por build_filter_sos al tocar los combos de
+        filtro)."""
+        if not self.recording_active or channel not in self.recording_channels:
+            return
+        if len(raw_codes) == 0:
+            return
+
+        gain = self.channel_plots[channel].gain
+        mv_values = code_to_millivolts(raw_codes, gain)
+
+        sos = self.current_filter_sos
+        if sos is not None:
+            state = self.recording_filter_state.get(channel)
+            if state is None or state[0] is not sos:
+                zi = sosfilt_zi(sos) * mv_values[0]
+            else:
+                zi = state[1]
+            mv_values, zi = sosfilt(sos, mv_values, zi=zi)
+            self.recording_filter_state[channel] = (sos, zi)
+        else:
+            self.recording_filter_state.pop(channel, None)
+
+        start_count = self.recording_sample_counts[channel]
+        elapsed = (np.arange(len(raw_codes)) + start_count) / SingleChannelPlot.ASSUMED_SAMPLE_RATE
+        self.recording_sample_counts[channel] = start_count + len(raw_codes)
+
+        self.recording_writer.writerows(zip(elapsed, [channel] * len(raw_codes), mv_values))
 
     # ---- Conexión ----
 
@@ -1732,6 +1969,8 @@ class MainWindow(QMainWindow):
                     if channel_a is not None:
                         self.channel_plots[channel_a].append_batch(values_a)
                         self.channel_plots[channel_b].append_batch(values_b)
+                        self._record_batch(channel_a, values_a)
+                        self._record_batch(channel_b, values_b)
                 elif tag == "rld":
                     _, values_a, values_b = msg
                     if self.rld_panel is not None and len(values_a) and len(values_b):
@@ -1745,27 +1984,54 @@ class MainWindow(QMainWindow):
             self.channel_plots[ch].refresh()
 
     def _rebuild_channel_grid(self):
-        """Recalcula qué canales están tildados en "Canales visibles" y
-        reparte el espacio de channel_grid_container entre ellos (ver
-        best_grid_shape): 1 canal ocupa toda el área, 4 canales la dividen
-        en 2x2, etc."""
+        """Recalcula qué canales están tildados en la sidebar "Canales" y
+        reconstruye channel_grid_container entero para que todos entren en
+        el espacio disponible sin scrollbar, priorizando siempre ver más
+        escala horizontal (tiempo) que vertical:
+        - 1-3 canales visibles: una sola columna, apilados uno arriba del
+          otro (ocupando el 100% del ancho disponible si es solo 1 canal).
+        - 4-8 canales visibles: dos columnas lado a lado (mitad izquierda y
+          mitad derecha), cada una apilada uno arriba del otro por su
+          cuenta — la izquierda se lleva ceil(n/2) canales y la derecha
+          floor(n/2) (p. ej. 5 canales -> 3 y 2; 7 canales -> 4 y 3).
+
+        Los QWidget "columna" son contenedores transitorios que se recrean
+        en cada llamada; los SingleChannelPlot en cambio son permanentes y
+        se re-parentan a la columna nueva (vía addWidget) antes de que Qt
+        efectivamente destruya la columna vieja (deleteLater() se ejecuta
+        recién en el próximo ciclo de eventos, así que el reparenting ya
+        ocurrió para entonces)."""
         while self.channel_grid.count():
             item = self.channel_grid.takeAt(0)
             widget = item.widget()
             if widget:
-                widget.hide()
+                widget.deleteLater()
 
         self.visible_channels = [ch for ch in range(1, 9) if self.channel_checks[ch].isChecked()]
         if not self.visible_channels:
             return
 
-        _rows, cols = best_grid_shape(len(self.visible_channels))
+        n = len(self.visible_channels)
+        if n <= 3:
+            columns = [self.visible_channels]
+        else:
+            left_count = -(-n // 2)  # ceil(n/2)
+            columns = [self.visible_channels[:left_count], self.visible_channels[left_count:]]
 
-        for i, ch in enumerate(self.visible_channels):
-            row, col = divmod(i, cols)
-            self.channel_grid.addWidget(self.channel_plots[ch], row, col)
-            self.channel_plots[ch].set_filter(self.current_filter_sos)
-            self.channel_plots[ch].show()
+        for column_channels in columns:
+            column_widget = QWidget()
+            column_layout = QVBoxLayout()
+            column_layout.setContentsMargins(0, 0, 0, 0)
+            column_layout.setSpacing(4)
+            column_widget.setLayout(column_layout)
+
+            for ch in column_channels:
+                plot = self.channel_plots[ch]
+                plot.set_filter(self.current_filter_sos)
+                column_layout.addWidget(plot, 1)
+                plot.show()
+
+            self.channel_grid.addWidget(column_widget)
 
     @pyqtSlot(int, int)
     def on_gain_changed(self, channel: int, gain: int):
@@ -1865,6 +2131,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self.queue_timer.stop()
         self.plot_timer.stop()
+        if self.recording_active:
+            self._stop_recording()
         self.disconnect_all()
         event.accept()
 

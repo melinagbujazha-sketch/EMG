@@ -306,29 +306,49 @@ decidió en sesión, sin un plan_*.md dedicado (ver este mismo `CLAUDE.md` para 
 ### Qué hace
 
 - Ventana con 3 pestañas (`QTabWidget`): **"Monitor"**, **"Señales de prueba"** y **"Avanzado"**.
-  Barra superior común a las 3: botones **"Conectar equipo"**/**"Desconectar equipo"**, un label de
-  estado agregado (verde = las 7 interfaces conectadas, ámbar = parcial, rojo = ninguna) y
-  **"Pantalla completa (F11)"** (`MainWindow.toggle_fullscreen()`). La ventana arranca maximizada.
+  Barra superior común a las 3: botones **"Conectar equipo"**/**"Desconectar equipo"** + label de
+  estado agregado (verde = las 7 interfaces conectadas, ámbar = parcial, rojo = ninguna),
+  **"Iniciar grabación"**/**"Detener grabación"** + label de estado (ver "Grabación a CSV" más
+  abajo), y **"Pantalla completa (F11)"** (`MainWindow.toggle_fullscreen()`). La ventana arranca
+  maximizada.
 - **"Monitor"** (pestaña principal, uso clínico): `QSplitter` horizontal con la sidebar a la
-  izquierda (~20% del ancho, `setStretchFactor(0, 1)` vs `(1, 4)`) y la grilla de plots a la
-  derecha (~80%):
-  - Sidebar (`MainWindow._build_sidebar()`):
+  izquierda (~20% del ancho, `setStretchFactor(0, 1)` vs `(1, 4)`) y el área de plots a la derecha
+  (~80%):
+  - Sidebar (`MainWindow._build_sidebar()`), sin ningún texto de nota que ocupe espacio de más —
+    todo son controles:
     - **"Canales"**: checkbox de visibilidad + combo de ganancia (`GAIN_VALUES`) por cada canal
-      físico (1-8). El checkbox reusa `_rebuild_channel_grid()`/`best_grid_shape(n)` — 1 canal
-      tildado ocupa toda el área, 4 canales la dividen 2×2, 8 canales 2×4, etc. Los 8
-      `SingleChannelPlot` **siempre** existen y reciben datos (`append_batch`) aunque estén
-      ocultos; destildar solo los saca del grid y de `refresh_plots()`. El combo de ganancia manda
-      `GAIN <ch> <valor>` (`_on_sidebar_gain_changed`) y se mantiene sincronizado con el combo
-      equivalente de `ConfigPanel` en "Avanzado" en ambos sentidos (incluida una relectura real de
-      configuración al conectar, ver más abajo).
+      físico (1-8). Los 8 `SingleChannelPlot` **siempre** existen y reciben datos (`append_batch`)
+      aunque estén ocultos; destildar solo los saca del área de plots y de `refresh_plots()`. El
+      combo de ganancia manda `GAIN <ch> <valor>` (`_on_sidebar_gain_changed`) y se mantiene
+      sincronizado con el combo equivalente de `ConfigPanel` en "Avanzado" en ambos sentidos
+      (incluida una relectura real de configuración al conectar, ver más abajo).
+    - **"Escala de los plots"**: combo Automática/Manual + spinbox+unidad para el eje X (s/ms) y
+      para el eje Y (mV/µV/V). Ver "Escala de los plots" más abajo.
     - **"Filtros (canales visibles)"**: 3 combos — Notch (Apagado/50 Hz/60 Hz), Pasaaltos
       (Apagado/20 Hz/50 Hz), Pasabajos (Apagado/150 Hz/500 Hz). Ver "Filtros de señal" más abajo.
-    - **"RLD / Lead-off"**: dos checkboxes ON/OFF simples. RLD manda `RLD ON`/`RLD OFF`. Lead-off
-      manda `LOFF_CH <ch> P/N 1` (ON) o `0` (OFF) para los 8 canales de una vez, usando los
-      parámetros finos (`LOFF_MODE`/`LOFF_TYPE`/`LOFF_CURRENT`/`LOFF_THRESHOLD`) que estén
-      configurados en "Avanzado".
-  - Grilla de plots: igual que antes (`SingleChannelPlot`, eje Y en mV con autoescala,
-    `MainWindow.pair_channels` rutea los batches de `poll_process_queues`).
+    - **"RLD / Lead-off"**: dos checkboxes ON/OFF simples, sin nada más. RLD manda `RLD ON`/
+      `RLD OFF`. Lead-off manda `LOFF_CH <ch> P/N 1` (ON) o `0` (OFF) para los 8 canales de una vez,
+      usando los parámetros finos (`LOFF_MODE`/`LOFF_TYPE`/`LOFF_CURRENT`/`LOFF_THRESHOLD`) que
+      estén configurados en "Avanzado" (esa referencia solo vive en este `CLAUDE.md`, no como texto
+      en la sidebar).
+  - Área de plots (`MainWindow._rebuild_channel_grid()`): sin scrollbar — siempre se reparte para
+    que los canales tildados entren en el espacio disponible, priorizando ver más escala horizontal
+    (tiempo) que vertical:
+    - **1-3 canales visibles**: una sola columna (`QVBoxLayout` con `addWidget(plot, stretch=1)`
+      por canal), ocupando el 100% del ancho si es 1 solo canal.
+    - **4-8 canales visibles**: dos columnas lado a lado dentro de `channel_grid`
+      (`QHBoxLayout`) — la izquierda se lleva `ceil(n/2)` canales y la derecha `floor(n/2)` (p. ej.
+      5 canales -> 3 y 2; 7 canales -> 4 y 3; 8 canales -> 4 y 4), cada columna con su propio
+      `QVBoxLayout` interno repartiendo la altura por igual entre sus canales.
+    - Los contenedores "columna" (`QWidget` con `QVBoxLayout`) son transitorios y se recrean
+      enteros en cada llamada; los `SingleChannelPlot` en cambio son permanentes — se re-parentan a
+      la columna nueva (`addWidget` los reparenta automáticamente) antes de que Qt destruya
+      efectivamente la columna vieja (`deleteLater()` corre recién en el próximo ciclo de eventos).
+    - `SingleChannelPlot`: eje Y en mV y eje X en **segundos**, ambos con autoescala por defecto (o
+      rango fijo en modo manual, ver más abajo); tipografía/interlineado reducidos (título del
+      `QGroupBox`, label de estado, ejes y ticks de pyqtgraph todos a ~9-10px, márgenes/spacing del
+      layout interno recortados) para que hasta 4 canales apilados en una misma columna entren sin
+      necesitar scroll. `MainWindow.pair_channels` rutea los batches de `poll_process_queues`.
 - **"Señales de prueba"** (`TestSignalPanel`, clase nueva e independiente de `ConfigPanel`): combos
   `TESTSIG`/`TESTSIG_AMP`/`TESTSIG_FREQ` + botones `START`/`STOP`, y un checkbox por canal que manda
   `MUX <ch> TEST` (tildado) o `MUX <ch> NORMAL` (destildado) — versión simplificada del combo
@@ -369,6 +389,59 @@ de CDC1 que siguen aplicándose en hardware).
   `MainWindow._on_filter_changed()` recalcula el SOS y lo propaga con `set_filter()` a
   `self.visible_channels`; `_rebuild_channel_grid()` también llama `set_filter()` sobre los
   canales que pasan a visibles, para que un canal recién tildado ya aparezca filtrado.
+
+### Escala de los plots (sidebar "Escala de los plots")
+
+Por defecto ambos ejes de cada `SingleChannelPlot` autoescalan (`pyqtgraph.enableAutoRange`), como
+antes. El combo "Modo" agrega una alternativa **Manual**:
+
+- Eje X: spinbox (`x_scale_spin`, 0.01-60) + combo de unidad (`s`/`ms`). Se traduce a segundos
+  (`_X_UNIT_TO_SECONDS`) y se muestra como los últimos `x_scale` segundos dentro de la ventana
+  bufferizada de `SingleChannelPlot.WINDOW_SECONDS` (4 s) — pedir más de 4 s no agrega historia
+  real, solo dejaría espacio en blanco a la izquierda.
+- Eje Y: spinbox (`y_scale_spin`, 0.001-10000) + combo de unidad (`mV`/`µV`/`V`, `_Y_UNIT_TO_MV`).
+  Se aplica como rango simétrico `[-y_scale, y_scale]` (la señal EMG se asume centrada en 0).
+- `MainWindow._on_scale_changed()` calcula ambos valores en las unidades internas (segundos/mV) y
+  llama `SingleChannelPlot.set_scale_mode(auto, x_seconds, y_mv)` sobre **los 8 canales** (no solo
+  los visibles), para que un canal recién tildado ya respete el modo/rango vigente.
+- En modo automático, `set_scale_mode` solo reactiva `enableAutoRange` en ambos ejes; en modo
+  manual lo desactiva y llama `setXRange`/`setYRange` una vez (no en cada `refresh()`).
+
+### Grabación a CSV (barra superior, "Iniciar grabación"/"Detener grabación")
+
+Botones **"Iniciar grabación"**/**"Detener grabación"** + label de estado, ubicados en la barra
+superior (a la par de "Conectar equipo"/"Desconectar equipo", no en la sidebar — así siempre están
+visibles sin competir por espacio con el resto de los controles). El path completo del archivo
+queda como *tooltip* del label (el texto en pantalla es corto, solo "Grabando canales ..."/
+"Grabación guardada"). Al iniciar:
+
+- Pide carpeta de destino con `QFileDialog.getExistingDirectory` y arma un nombre de archivo
+  automático `emg_recording_<YYYYMMDD_HHMMSS>.csv` (`MainWindow._start_recording`).
+- Graba **los canales tildados en ese momento** (`self.visible_channels`, copiados a
+  `self.recording_channels`) — si después se tildan/destildan canales durante la grabación, la
+  grabación sigue solo con el conjunto original.
+- Formato CSV **"tidy"/largo** (decidido con el usuario): columnas `tiempo_s, canal, mV`, una fila
+  por muestra y canal. Se eligió sobre un formato "ancho" (una columna por canal) porque cada par
+  de canales llega por un proceso/CDC independiente (ver "Arquitectura de conexión" más abajo) y no
+  siempre en el mismo instante exacto — alinear a la fuerza en una sola fila por timestamp podría
+  dejar celdas vacías o desfasajes de milisegundos entre columnas.
+- El valor `mV` es **la señal filtrada** (decidido con el usuario, igual a lo que se ve en
+  pantalla), no la señal cruda. Como `SingleChannelPlot` filtra con `sosfiltfilt` (fase cero) sobre
+  toda la ventana visible — que no tiene sentido aplicar muestra a muestra sobre un archivo
+  continuo — `MainWindow._record_batch()` implementa un filtrado **streaming** equivalente con
+  `scipy.signal.sosfilt` manteniendo el estado (`zi`, inicializado con `sosfilt_zi(sos) *
+  primera_muestra` para no arrancar con un transitorio hacia 0) persistente entre batches
+  (`self.recording_filter_state[canal] = (sos, zi)`). El resultado es el mismo filtro (mismos
+  cortes) pero no bit-a-bit idéntico al de pantalla (fase cero vs. causal) — trade-off aceptado
+  explícitamente por el usuario. Si no hay ningún filtro activo (`current_filter_sos is None`), se
+  graba el valor sin filtrar (igual a lo que se ve en pantalla en ese caso).
+- El tiempo (`tiempo_s`) se calcula por canal como un contador de muestras acumulado dividido por
+  `SingleChannelPlot.ASSUMED_SAMPLE_RATE` (8000), no un timestamp de reloj de pared — asume
+  streaming continuo sin pérdida de muestras, misma asunción que ya hace el resto de la GUI.
+- La escritura ocurre en `MainWindow.poll_process_queues()` (tag `"frame"`), justo después de
+  `append_batch()`, para no depender de la tasa de refresco de pantalla.
+- `_stop_recording()` cierra el archivo; `closeEvent()` también detiene una grabación en curso si
+  se cierra la ventana sin apretar "Detener grabación".
 
 ### Lectura automática de la configuración real del ADS1298 al conectar
 
