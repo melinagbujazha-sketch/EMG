@@ -1203,6 +1203,7 @@ class MainWindow(QMainWindow):
         self.channel_plots = {}   # SingleChannelPlot por canal físico (1-8)
         self.channel_checks = {}  # QCheckBox "canal visible" (1-8), en la sidebar
         self.channel_gain_combos = {}  # QComboBox de ganancia por canal, en la sidebar
+        self.channel_leadoff_labels = {}  # QLabel "Desconectado" por canal, en la sidebar
         self.visible_channels = []
         self.rld_panel = None     # RldStatusPanel para CDC6, en "Avanzado"
         self.connections = {}     # name -> ThreadConnection | ProcessConnection
@@ -1370,6 +1371,17 @@ class MainWindow(QMainWindow):
             )
             grid.addWidget(gain_combo, row, 2)
             self.channel_gain_combos[ch] = gain_combo
+
+            # Cartel de lead-off: solo se muestra cuando "Lead-off activo"
+            # está tildado (ver _on_leadoff_toggle) y llega un LOFF_STATP/N
+            # con el bit de ese canal en 1 (ver poll_process_queues, tag
+            # "rld"). Vacío el resto del tiempo para no ocupar espacio.
+            leadoff_label = QLabel("")
+            leadoff_label.setStyleSheet(
+                "color: white; background-color: #b00020; font-weight: bold; font-size: 9px;"
+            )
+            grid.addWidget(leadoff_label, row, 3)
+            self.channel_leadoff_labels[ch] = leadoff_label
 
         box.setLayout(grid)
         return box
@@ -1582,6 +1594,16 @@ class MainWindow(QMainWindow):
             combo.blockSignals(False)
 
     def _on_rld_toggle(self, checked: bool):
+        # Habilitar CONFIG3.PD_RLD solo enciende el amplificador RLD; sin
+        # seleccionar canales en RLD_SENSP/N (reset = 0x00, ninguno) el
+        # amplificador queda sin ninguna entrada real y no hace rechazo de
+        # modo común de verdad. Se incluyen los 8 canales para que el lazo
+        # de realimentación tenga efecto perceptible al conectar el
+        # electrodo de RLD.
+        value = 1 if checked else 0
+        for ch in range(1, 9):
+            self.send_config_command(f"RLD_CH {ch} P {value}")
+            self.send_config_command(f"RLD_CH {ch} N {value}")
         self.send_config_command(f"RLD {'ON' if checked else 'OFF'}")
 
     def _on_leadoff_toggle(self, checked: bool):
@@ -1589,6 +1611,23 @@ class MainWindow(QMainWindow):
         for ch in range(1, 9):
             self.send_config_command(f"LOFF_CH {ch} P {value}")
             self.send_config_command(f"LOFF_CH {ch} N {value}")
+        if not checked:
+            for label in self.channel_leadoff_labels.values():
+                label.setText("")
+
+    def _update_leadoff_labels(self, statp: int, statn: int):
+        """Muestra "Desconectado" junto a "Canal N" en la sidebar cuando
+        LOFF_STATP/LOFF_STATN marca ese canal como desconectado (ver
+        RldStatusPanel.update_status para el mismo mapeo de bits, en
+        "Avanzado"). Solo tiene sentido mientras "Lead-off activo" está
+        tildado: si no, los comparadores no están habilitados para esos
+        canales y los bits no reflejan nada real."""
+        if not self.leadoff_toggle.isChecked():
+            return
+        for ch in range(1, 9):
+            bit = ch - 1
+            disconnected = bool((statp >> bit) & 1) or bool((statn >> bit) & 1)
+            self.channel_leadoff_labels[ch].setText("Desconectado" if disconnected else "")
 
     # ---- Grabación a CSV ----
 
@@ -1973,8 +2012,11 @@ class MainWindow(QMainWindow):
                         self._record_batch(channel_b, values_b)
                 elif tag == "rld":
                     _, values_a, values_b = msg
-                    if self.rld_panel is not None and len(values_a) and len(values_b):
-                        self.rld_panel.update_status(int(values_a[-1]), int(values_b[-1]))
+                    if len(values_a) and len(values_b):
+                        statp, statn = int(values_a[-1]), int(values_b[-1])
+                        if self.rld_panel is not None:
+                            self.rld_panel.update_status(statp, statn)
+                        self._update_leadoff_labels(statp, statn)
 
     def refresh_plots(self):
         # Solo redibuja los canales que están visibles: los ocultos siguen

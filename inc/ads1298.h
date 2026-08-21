@@ -126,6 +126,12 @@ public:
     static constexpr uint8_t CONFIG3_PD_REFBUF_BIT = 0x80;
     static constexpr uint8_t CONFIG3_PD_RLD_BIT = 0x04; // 1 = amplificador RLD habilitado
 
+    // CONFIG4 (0x17)
+    // 1 = comparadores de lead-off habilitados. Reset por defecto = 0
+    // (apagados): sin este bit, LOFF_STATP/LOFF_STATN quedan siempre en 0
+    // (todos "conectados") sin importar LOFF_SENSx/LOFF_MODE/LOFF_CURRENT.
+    static constexpr uint8_t CONFIG4_PD_LOFF_COMP_BIT = 0x04;
+
     // CHnSET (0x05-0x0C)
     static constexpr uint8_t CHSET_PD_BIT     = 0x80; // 1 = canal apagado (power-down)
     static constexpr uint8_t CHSET_GAIN_MASK  = 0x70;

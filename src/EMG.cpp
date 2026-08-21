@@ -30,12 +30,19 @@ static constexpr uint8_t DEFAULT_CONFIG1 = ads1298::CONFIG1_HR_BIT | 0x02;
 // dependa de ella (incluida la test signal interna).
 static constexpr uint8_t DEFAULT_CONFIG3 = 0x40 | ads1298::CONFIG3_PD_REFBUF_BIT;
 
+// CONFIG4 de arranque: PD_LOFF_COMP=1 para habilitar los comparadores de
+// lead-off. Sin este bit el reset de fábrica los deja apagados y
+// LOFF_STATP/LOFF_STATN quedan siempre en 0 (todos "conectados") sin
+// importar LOFF_SENSx/LOFF_MODE/LOFF_CURRENT/LOFF_THRESHOLD.
+static constexpr uint8_t DEFAULT_CONFIG4 = ads1298::CONFIG4_PD_LOFF_COMP_BIT;
+
 static void configure_ads_defaults()
 {
     ads.lock();
     ads.sendCommand(ads1298::CMD_SDATAC);
     ads.writeRegister(ads1298::REG_CONFIG1, DEFAULT_CONFIG1);
     ads.writeRegister(ads1298::REG_CONFIG3, DEFAULT_CONFIG3);
+    ads.writeRegister(ads1298::REG_CONFIG4, DEFAULT_CONFIG4);
     ads.unlock();
 }
 

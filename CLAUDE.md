@@ -181,6 +181,13 @@ diseño original (con el contexto completo de las decisiones tomadas) quedó gua
   hay que validar en hardware antes de confiar en cualquier lectura de EMG.
 - Como el ADS1298 muestrea los 8 canales simultáneamente, cada evento de DRDY ya trae ambos canales
   de un mismo CDC juntos en una sola trama — no hace falta un bit discriminador de canal.
+- **`CONFIG4.PD_LOFF_COMP` (comparadores de lead-off) debe habilitarse explícitamente.**
+  `configure_ads_defaults()` escribe `DEFAULT_CONFIG4 = CONFIG4_PD_LOFF_COMP_BIT` (0x04).
+  **Bug real corregido:** el firmware nunca tocaba `CONFIG4`, así que los comparadores de lead-off
+  quedaban permanentemente apagados (reset de fábrica) — `LOFF_STATP`/`LOFF_STATN` leían siempre 0
+  (todos "conectados") sin importar `LOFF_CH`/`LOFF_MODE`/`LOFF_TYPE`/`LOFF_CURRENT`/
+  `LOFF_THRESHOLD`. Detectado porque la detección de lead-off no reaccionaba nunca en la GUI aunque
+  hubiera canales sin electrodo conectado.
 
 ### Formato de trama binaria por USB
 
@@ -316,21 +323,39 @@ decidió en sesión, sin un plan_*.md dedicado (ver este mismo `CLAUDE.md` para 
   (~80%):
   - Sidebar (`MainWindow._build_sidebar()`), sin ningún texto de nota que ocupe espacio de más —
     todo son controles:
-    - **"Canales"**: checkbox de visibilidad + combo de ganancia (`GAIN_VALUES`) por cada canal
-      físico (1-8). Los 8 `SingleChannelPlot` **siempre** existen y reciben datos (`append_batch`)
-      aunque estén ocultos; destildar solo los saca del área de plots y de `refresh_plots()`. El
-      combo de ganancia manda `GAIN <ch> <valor>` (`_on_sidebar_gain_changed`) y se mantiene
-      sincronizado con el combo equivalente de `ConfigPanel` en "Avanzado" en ambos sentidos
-      (incluida una relectura real de configuración al conectar, ver más abajo).
+    - **"Canales"**: checkbox de visibilidad + combo de ganancia (`GAIN_VALUES`) + cartel de
+      lead-off (`channel_leadoff_labels`) por cada canal físico (1-8). Los 8 `SingleChannelPlot`
+      **siempre** existen y reciben datos (`append_batch`) aunque estén ocultos; destildar solo los
+      saca del área de plots y de `refresh_plots()`. El combo de ganancia manda `GAIN <ch> <valor>`
+      (`_on_sidebar_gain_changed`) y se mantiene sincronizado con el combo equivalente de
+      `ConfigPanel` en "Avanzado" en ambos sentidos (incluida una relectura real de configuración al
+      conectar, ver más abajo). El cartel de lead-off (texto "Desconectado" en rojo, vacío el resto
+      del tiempo) lo llena `MainWindow._update_leadoff_labels()` a partir de cada trama de CDC6
+      (`poll_process_queues`, tag `"rld"`) — mismo mapeo de bits que `RldStatusPanel.update_status`
+      en "Avanzado" (bit `ch-1` de `LOFF_STATP`/`LOFF_STATN`; canal desconectado si cualquiera de
+      los dos está en 1) — y solo mientras el checkbox "Lead-off activo" está tildado (si no, los
+      comparadores no están configurados para esos canales y los bits no reflejan nada real).
     - **"Escala de los plots"**: combo Automática/Manual + spinbox+unidad para el eje X (s/ms) y
-      para el eje Y (mV/µV/V). Ver "Escala de los plots" más abajo.
+      para el eje Y (mV/µV/V). Ver "Escala de los plots" más abajo. **Importante para verificar
+      filtros a ojo:** en modo Automática (el default) el autorange de pyqtgraph reescala el eje Y
+      para llenar el panel con la amplitud que haya en cada momento — si un filtro reduce la
+      amplitud real (ruido de línea, deriva DC), el plot hace zoom y la forma se ve visualmente
+      igual aunque los mV cambiaron. Para confirmar que un filtro realmente está actuando, pasar a
+      modo Manual con un rango Y fijo antes de activarlo/desactivarlo.
     - **"Filtros (canales visibles)"**: 3 combos — Notch (Apagado/50 Hz/60 Hz), Pasaaltos
       (Apagado/20 Hz/50 Hz), Pasabajos (Apagado/150 Hz/500 Hz). Ver "Filtros de señal" más abajo.
-    - **"RLD / Lead-off"**: dos checkboxes ON/OFF simples, sin nada más. RLD manda `RLD ON`/
-      `RLD OFF`. Lead-off manda `LOFF_CH <ch> P/N 1` (ON) o `0` (OFF) para los 8 canales de una vez,
-      usando los parámetros finos (`LOFF_MODE`/`LOFF_TYPE`/`LOFF_CURRENT`/`LOFF_THRESHOLD`) que
-      estén configurados en "Avanzado" (esa referencia solo vive en este `CLAUDE.md`, no como texto
-      en la sidebar).
+    - **"RLD / Lead-off"**: dos checkboxes ON/OFF simples, sin nada más. RLD manda primero
+      `RLD_CH <ch> P/N 1` (ON) o `0` (OFF) para los 8 canales y recién después `RLD ON`/`RLD OFF`
+      (`_on_rld_toggle`) — **bug real corregido:** antes solo mandaba `RLD ON/OFF`
+      (`CONFIG3.PD_RLD`, que únicamente enciende el amplificador), sin tocar nunca
+      `RLD_SENSP`/`RLD_SENSN` (reset = 0x00, ningún canal incluido); el amplificador quedaba
+      encendido pero sin ninguna entrada real, así que no hacía rechazo de modo común y no había
+      cambio perceptible al conectar el electrodo de RLD. Lead-off manda `LOFF_CH <ch> P/N 1` (ON) o
+      `0` (OFF) para los 8 canales de una vez, usando los parámetros finos (`LOFF_MODE`/
+      `LOFF_TYPE`/`LOFF_CURRENT`/`LOFF_THRESHOLD`) que estén configurados en "Avanzado" (esa
+      referencia solo vive en este `CLAUDE.md`, no como texto en la sidebar); ver también el bug de
+      firmware corregido en `CONFIG4.PD_LOFF_COMP` (sección "Presupuesto de throughput USB") sin el
+      cual esto nunca funcionaba, sea cual sea la configuración de la GUI.
   - Área de plots (`MainWindow._rebuild_channel_grid()`): sin scrollbar — siempre se reparte para
     que los canales tildados entren en el espacio disponible, priorizando ver más escala horizontal
     (tiempo) que vertical:
@@ -618,6 +643,11 @@ COM9→CDC3, COM10→CDC0), confirmando que la detección por banner es necesari
       (si se pierde sync se nota como un salto/glitch puntual en el plot).
    - **Nota importante:** esto todavía no se probó contra la placa física con el firmware nuevo
      flasheado — falta esa validación en hardware real.
+   - **Pendiente de re-flashear y re-probar (sesión 2026-08-21):** se corrigieron dos bugs reales de
+     firmware que impedían usar RLD y lead-off (`CONFIG4.PD_LOFF_COMP` nunca habilitado, y `RLD
+     ON`/`OFF` sin seleccionar canales en `RLD_SENSP`/`N`; ver "Presupuesto de throughput USB" y la
+     sección "RLD / Lead-off" de la GUI). Falta compilar, flashear y validar en la placa real que
+     ahora sí se detecten desconexiones de electrodo y que el RLD reduzca ruido de modo común.
 2. Evaluar si conviene throttlear el envío de CDC6 (RLD/lead-off) a una fracción de la tasa de
    muestreo, ya que ese estado cambia mucho más lento que la señal EMG y hoy se manda a la misma
    cadencia que los datos.
