@@ -57,6 +57,11 @@ Interfaz clínica (3 pestañas):
     (TESTSIG/AMP/FREQ) y enrutarla a los canales elegidos (MUX TEST/NORMAL
     simplificado), para la validación en 3 etapas descrita en CLAUDE.md.
 
+    "Análisis" (RecordingAnalysisPanel) carga offline un CSV grabado por
+    "Iniciar grabación" (no requiere el equipo conectado), lo grafica por
+    canal y muestra la amplitud pico a pico (max mV - min mV) del rango de
+    tiempo seleccionado arrastrando una región sobre el propio plot.
+
     "Avanzado" concentra todo lo que antes era la UI de debug, sin recortar
     funcionalidad: mapeo manual de puertos por CDC, paneles de texto crudo de
     CDC0/CDC1 (incluyendo RREG/WREG a mano), el estado completo de
@@ -588,8 +593,15 @@ class SingleChannelPlot(QGroupBox):
         self.setMinimumWidth(150)
         self.setStyleSheet("QGroupBox { font-size: 10px; margin-top: 4px; }")
 
-        self.status = QLabel("Desconectado")
-        self.status.setStyleSheet("color: red; font-weight: bold; font-size: 9px;")
+        # Cartel de lead-off (ver set_leadoff/MainWindow._update_leadoff_status):
+        # vacío y sin fondo la mayor parte del tiempo, solo se pinta cuando
+        # ese canal está realmente desconectado. Antes acá se mostraba el
+        # estado de conexión del CDC de datos ("Conectado a COMx"/
+        # "Desconectado"), quitado porque no aportaba nada que no estuviera
+        # ya en el label agregado de la barra superior y confundía con el
+        # aviso de lead-off.
+        self.leadoff_label = QLabel("")
+        self.leadoff_label.setStyleSheet("font-size: 9px;")
 
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.setBackground("k")
@@ -615,14 +627,24 @@ class SingleChannelPlot(QGroupBox):
         layout = QVBoxLayout()
         layout.setContentsMargins(4, 2, 4, 4)
         layout.setSpacing(2)
-        layout.addWidget(self.status)
+        layout.addWidget(self.leadoff_label)
         layout.addWidget(self.plot_widget)
         self.setLayout(layout)
 
-    def set_connected(self, connected: bool, msg: str):
-        self.status.setText(msg)
-        color = "green" if connected else "red"
-        self.status.setStyleSheet(f"color: {color}; font-weight: bold; font-size: 9px;")
+    def set_leadoff(self, disconnected: bool):
+        """Cartel "Electrodo desconectado" bajo el título del canal (ver
+        MainWindow._update_leadoff_status, que lo llama con el bit de
+        LOFF_STATP/LOFF_STATN de este canal). Solo tiene efecto visible
+        mientras "Lead-off activo" está tildado en la sidebar; en cualquier
+        otro momento se llama con disconnected=False y queda vacío."""
+        if disconnected:
+            self.leadoff_label.setText("Electrodo desconectado")
+            self.leadoff_label.setStyleSheet(
+                "color: white; background-color: #b00020; font-weight: bold; font-size: 9px;"
+            )
+        else:
+            self.leadoff_label.setText("")
+            self.leadoff_label.setStyleSheet("font-size: 9px;")
 
     def set_gain(self, gain: int):
         """Actualiza la ganancia usada para convertir a mV (llamado desde
@@ -1141,6 +1163,213 @@ class TestSignalPanel(QWidget):
 
 
 # ==================================================
+# Pestaña "Análisis": carga y visualización de grabaciones CSV previas
+# ==================================================
+
+
+class RecordingAnalysisPanel(QWidget):
+    """Carga un CSV grabado por MainWindow._start_recording (formato tidy:
+    columnas tiempo_s, canal, mV, ver docstring de _start_recording) y lo
+    visualiza en un plot propio, totalmente independiente de la adquisición
+    en vivo (no toca self.connections ni ningún estado de MainWindow).
+
+    El recuadro "Amplitud del rango seleccionado" a la derecha del plot
+    muestra, dentro del rango de tiempo elegido: pico a pico (max(mV) -
+    min(mV)) y RMS (sqrt(mean(mV^2)), fórmula estándar para una señal
+    discreta x[n] con N muestras: RMS = sqrt((1/N) * sum(x[n]^2))). Ese
+    rango se elige arrastrando los bordes de una región (pg.LinearRegionItem)
+    superpuesta al plot -- no hace falta tipear números; el rango completo
+    del canal se ve al cargar el archivo o al tocar "Ver todo el rango"."""
+
+    def __init__(self):
+        super().__init__()
+
+        # canal -> (tiempo_s, mV) como np.ndarray, ordenados por tiempo.
+        self.channel_data = {}
+        self.current_channel = None
+
+        root = QHBoxLayout()
+        self.setLayout(root)
+
+        # ---- Columna izquierda: carga de archivo + plot ----
+        left = QVBoxLayout()
+
+        load_row = QHBoxLayout()
+        self.load_button = QPushButton("Cargar grabación...")
+        self.load_button.clicked.connect(self._load_recording)
+        load_row.addWidget(self.load_button)
+
+        self.file_label = QLabel("Ninguna grabación cargada")
+        load_row.addWidget(self.file_label)
+        load_row.addStretch()
+        left.addLayout(load_row)
+
+        self.plot_widget = pg.PlotWidget()
+        self.plot_widget.setBackground("k")
+        self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        self.plot_widget.setLabel("left", "mV")
+        self.plot_widget.setLabel("bottom", "Tiempo (s)")
+        self.curve = self.plot_widget.plot(pen=pg.mkPen("y", width=1))
+
+        # Región arrastrable que define el rango de tiempo sobre el que se
+        # calcula la amplitud pico a pico (ver _on_region_changed). Su
+        # extensión vertical es infinita (orientation vertical por
+        # defecto), pyqtgraph la excluye del autorange del eje Y.
+        self.region = pg.LinearRegionItem()
+        self.region.setZValue(10)
+        self.region.sigRegionChanged.connect(self._on_region_changed)
+        self.plot_widget.addItem(self.region)
+
+        left.addWidget(self.plot_widget)
+        root.addLayout(left, stretch=4)
+
+        # ---- Columna derecha: selección de canal + amplitud pico a pico ----
+        right = QVBoxLayout()
+
+        channel_box = QGroupBox("Canal")
+        channel_layout = QVBoxLayout()
+        self.channel_combo = QComboBox()
+        self.channel_combo.currentTextChanged.connect(self._on_channel_changed)
+        channel_layout.addWidget(self.channel_combo)
+        channel_box.setLayout(channel_layout)
+        right.addWidget(channel_box)
+
+        amplitude_box = QGroupBox("Amplitud del rango seleccionado")
+        amplitude_layout = QVBoxLayout()
+
+        self.range_label = QLabel("Rango: -")
+        self.range_label.setWordWrap(True)
+        amplitude_layout.addWidget(self.range_label)
+
+        amplitude_layout.addWidget(QLabel("Pico a pico:"))
+        self.p2p_label = QLabel("- mV")
+        self.p2p_label.setStyleSheet("font-size: 22px; font-weight: bold;")
+        amplitude_layout.addWidget(self.p2p_label)
+
+        amplitude_layout.addWidget(QLabel("RMS:"))
+        self.rms_label = QLabel("- mV")
+        self.rms_label.setStyleSheet("font-size: 22px; font-weight: bold;")
+        amplitude_layout.addWidget(self.rms_label)
+
+        self.reset_range_button = QPushButton("Ver todo el rango")
+        self.reset_range_button.clicked.connect(self._reset_region)
+        amplitude_layout.addWidget(self.reset_range_button)
+
+        amplitude_box.setLayout(amplitude_layout)
+        right.addWidget(amplitude_box)
+
+        right.addStretch()
+        root.addLayout(right, stretch=1)
+
+    # ---- Carga de archivo ----
+
+    def _load_recording(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Cargar grabación", "", "CSV (*.csv)")
+        if not path:
+            return
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            data = self._read_tidy_csv(path)
+        except (OSError, ValueError) as exc:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "Error al cargar", f"No se pudo leer el archivo:\n{exc}")
+            return
+        QApplication.restoreOverrideCursor()
+
+        if not data:
+            QMessageBox.warning(
+                self, "Archivo vacío",
+                "El archivo no tiene datos con el formato esperado (tiempo_s, canal, mV).",
+            )
+            return
+
+        self.channel_data = data
+        self.file_label.setText(os.path.basename(path))
+        self.file_label.setToolTip(path)
+
+        self.channel_combo.blockSignals(True)
+        self.channel_combo.clear()
+        self.channel_combo.addItems([str(ch) for ch in sorted(self.channel_data.keys())])
+        self.channel_combo.blockSignals(False)
+
+        self._on_channel_changed(self.channel_combo.currentText())
+
+    @staticmethod
+    def _read_tidy_csv(path: str):
+        """Lee un CSV con columnas tiempo_s, canal, mV y devuelve
+        {canal: (tiempo_s, mV)} como np.ndarray, ordenados por tiempo. Las
+        filas de un mismo canal ya llegan ordenadas por tiempo en el
+        archivo (ver MainWindow._record_batch), pero se ordenan igual acá
+        por robustez ante archivos editados a mano."""
+        raw = {}  # canal -> ([tiempo_s], [mV])
+        with open(path, newline="") as f:
+            reader = csv.reader(f)
+            next(reader, None)  # descarta encabezado tiempo_s,canal,mV
+            for row in reader:
+                if len(row) < 3:
+                    continue
+                t_val, ch_val, mv_val = row[0], row[1], row[2]
+                bucket = raw.setdefault(int(ch_val), ([], []))
+                bucket[0].append(float(t_val))
+                bucket[1].append(float(mv_val))
+
+        result = {}
+        for ch, (t_list, mv_list) in raw.items():
+            t_arr = np.asarray(t_list, dtype=np.float64)
+            mv_arr = np.asarray(mv_list, dtype=np.float64)
+            order = np.argsort(t_arr)
+            result[ch] = (t_arr[order], mv_arr[order])
+        return result
+
+    # ---- Selección de canal / plot ----
+
+    def _on_channel_changed(self, text: str):
+        if not text or not self.channel_data:
+            return
+        ch = int(text)
+        self.current_channel = ch
+        t_arr, mv_arr = self.channel_data[ch]
+        self.curve.setData(t_arr, mv_arr)
+
+        if len(t_arr):
+            self.region.blockSignals(True)
+            self.region.setRegion((float(t_arr[0]), float(t_arr[-1])))
+            self.region.blockSignals(False)
+        self._on_region_changed()
+
+    def _reset_region(self):
+        if self.current_channel is None or self.current_channel not in self.channel_data:
+            return
+        t_arr, _ = self.channel_data[self.current_channel]
+        if len(t_arr):
+            self.region.setRegion((float(t_arr[0]), float(t_arr[-1])))
+
+    def _on_region_changed(self):
+        if self.current_channel is None or self.current_channel not in self.channel_data:
+            return
+        t_arr, mv_arr = self.channel_data[self.current_channel]
+        if len(t_arr) == 0:
+            return
+
+        xmin, xmax = self.region.getRegion()
+        lo = np.searchsorted(t_arr, xmin, side="left")
+        hi = np.searchsorted(t_arr, xmax, side="right")
+
+        self.range_label.setText(f"Rango: {xmin:.3f} s – {xmax:.3f} s")
+
+        if hi > lo:
+            segment = mv_arr[lo:hi]
+            p2p = float(segment.max() - segment.min())
+            rms = float(np.sqrt(np.mean(np.square(segment))))
+            self.p2p_label.setText(f"{p2p:.4f} mV")
+            self.rms_label.setText(f"{rms:.4f} mV")
+        else:
+            self.p2p_label.setText("- mV")
+            self.rms_label.setText("- mV")
+
+
+# ==================================================
 # Conexiones: hilo (texto, CDC0/CDC1) o proceso (binario, CDC2-6)
 # ==================================================
 
@@ -1185,8 +1414,8 @@ class ProcessConnection:
 class MainWindow(QMainWindow):
     # Combos de la sidebar de filtros -> parámetro de build_filter_sos().
     _NOTCH_HZ = {"Apagado": None, "50 Hz": 50, "60 Hz": 60}
-    _HPF_HZ = {"Apagado": None, "20 Hz": 20, "50 Hz": 50}
-    _LPF_HZ = {"Apagado": None, "150 Hz": 150, "500 Hz": 500}
+    _HPF_HZ = {"Apagado": None, "1 Hz": 1, "20 Hz": 20, "50 Hz": 50}
+    _LPF_HZ = {"Apagado": None, "125 Hz": 125, "150 Hz": 150, "500 Hz": 500}
 
     # Combos de unidad de la sidebar "Escala de los plots" -> factor de
     # conversión a las unidades internas (segundos / mV).
@@ -1203,7 +1432,6 @@ class MainWindow(QMainWindow):
         self.channel_plots = {}   # SingleChannelPlot por canal físico (1-8)
         self.channel_checks = {}  # QCheckBox "canal visible" (1-8), en la sidebar
         self.channel_gain_combos = {}  # QComboBox de ganancia por canal, en la sidebar
-        self.channel_leadoff_labels = {}  # QLabel "Desconectado" por canal, en la sidebar
         self.visible_channels = []
         self.rld_panel = None     # RldStatusPanel para CDC6, en "Avanzado"
         self.connections = {}     # name -> ThreadConnection | ProcessConnection
@@ -1272,6 +1500,7 @@ class MainWindow(QMainWindow):
 
         tabs.addTab(self._build_monitor_tab(), "Monitor")
         tabs.addTab(self._build_test_signal_tab(), "Señales de prueba")
+        tabs.addTab(self._build_analysis_tab(), "Análisis")
         tabs.addTab(self._build_advanced_tab(), "Avanzado")
 
         self.connect_equipment_button.clicked.connect(self.connect_equipment)
@@ -1372,17 +1601,6 @@ class MainWindow(QMainWindow):
             grid.addWidget(gain_combo, row, 2)
             self.channel_gain_combos[ch] = gain_combo
 
-            # Cartel de lead-off: solo se muestra cuando "Lead-off activo"
-            # está tildado (ver _on_leadoff_toggle) y llega un LOFF_STATP/N
-            # con el bit de ese canal en 1 (ver poll_process_queues, tag
-            # "rld"). Vacío el resto del tiempo para no ocupar espacio.
-            leadoff_label = QLabel("")
-            leadoff_label.setStyleSheet(
-                "color: white; background-color: #b00020; font-weight: bold; font-size: 9px;"
-            )
-            grid.addWidget(leadoff_label, row, 3)
-            self.channel_leadoff_labels[ch] = leadoff_label
-
         box.setLayout(grid)
         return box
 
@@ -1475,6 +1693,13 @@ class MainWindow(QMainWindow):
         scroll.setWidgetResizable(True)
         scroll.setWidget(self.test_signal_panel)
         return scroll
+
+    def _build_analysis_tab(self) -> QWidget:
+        """Pestaña independiente de la adquisición en vivo: carga un CSV de
+        una grabación previa (ver RecordingAnalysisPanel) para revisarla
+        offline sin necesitar el equipo conectado."""
+        self.analysis_panel = RecordingAnalysisPanel()
+        return self.analysis_panel
 
     def _build_advanced_tab(self) -> QWidget:
         """Todo lo que antes era la UI principal de debug: mapeo manual de
@@ -1612,22 +1837,22 @@ class MainWindow(QMainWindow):
             self.send_config_command(f"LOFF_CH {ch} P {value}")
             self.send_config_command(f"LOFF_CH {ch} N {value}")
         if not checked:
-            for label in self.channel_leadoff_labels.values():
-                label.setText("")
+            for plot in self.channel_plots.values():
+                plot.set_leadoff(False)
 
-    def _update_leadoff_labels(self, statp: int, statn: int):
-        """Muestra "Desconectado" junto a "Canal N" en la sidebar cuando
-        LOFF_STATP/LOFF_STATN marca ese canal como desconectado (ver
-        RldStatusPanel.update_status para el mismo mapeo de bits, en
-        "Avanzado"). Solo tiene sentido mientras "Lead-off activo" está
-        tildado: si no, los comparadores no están habilitados para esos
-        canales y los bits no reflejan nada real."""
+    def _update_leadoff_status(self, statp: int, statn: int):
+        """Muestra "Electrodo desconectado" bajo el título de cada
+        SingleChannelPlot cuando LOFF_STATP/LOFF_STATN marca ese canal como
+        desconectado (ver RldStatusPanel.update_status para el mismo mapeo
+        de bits, en "Avanzado"). Solo tiene sentido mientras "Lead-off
+        activo" está tildado: si no, los comparadores no están habilitados
+        para esos canales y los bits no reflejan nada real."""
         if not self.leadoff_toggle.isChecked():
             return
         for ch in range(1, 9):
             bit = ch - 1
             disconnected = bool((statp >> bit) & 1) or bool((statn >> bit) & 1)
-            self.channel_leadoff_labels[ch].setText("Desconectado" if disconnected else "")
+            self.channel_plots[ch].set_leadoff(disconnected)
 
     # ---- Grabación a CSV ----
 
@@ -2016,7 +2241,7 @@ class MainWindow(QMainWindow):
                         statp, statn = int(values_a[-1]), int(values_b[-1])
                         if self.rld_panel is not None:
                             self.rld_panel.update_status(statp, statn)
-                        self._update_leadoff_labels(statp, statn)
+                        self._update_leadoff_status(statp, statn)
 
     def refresh_plots(self):
         # Solo redibuja los canales que están visibles: los ocultos siguen
@@ -2097,15 +2322,14 @@ class MainWindow(QMainWindow):
             self.showFullScreen()
 
     def _update_connection_status(self, name: str, connected: bool, text: str):
+        # Los CDC de datos (CDC2-5) ya no reflejan su estado de conexión en
+        # cada SingleChannelPlot (ver set_leadoff): ese lugar ahora se usa
+        # para el aviso de lead-off, y el estado agregado de conexión ya se
+        # ve en el label de la barra superior ("Equipo desconectado"/verde/
+        # ámbar/rojo).
         panel = self.panels.get(name)
         if panel:
             panel.set_connected(connected, text)
-            return
-
-        pair = self.pair_channels.get(name)
-        if pair:
-            for ch in pair:
-                self.channel_plots[ch].set_connected(connected, text)
             return
 
         if self.rld_panel is not None and name == self.rld_panel.name:

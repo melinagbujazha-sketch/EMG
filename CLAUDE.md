@@ -29,12 +29,14 @@ Implementado:
   paréntesis (p. ej. `"DATA STREAM CH1-CH2 (CDC2)"`), usado también para identificación automática
   de puertos desde la GUI de Python (ver más abajo).
 - GUI clínica en Python (`emg_multicdc_gui.py`, PyQt6 + pyserial + pyqtgraph + numpy + scipy), con
-  3 pestañas: **"Monitor"** (sidebar de canales/ganancia/filtros/RLD-lead-off al 20% + grilla de
+  4 pestañas: **"Monitor"** (sidebar de canales/ganancia/filtros/RLD-lead-off al 20% + grilla de
   plots en tiempo real al 80%, conexión de un solo botón), **"Señales de prueba"** (test signal
-  interna simplificada) y **"Avanzado"** (todo el detalle de debug: mapeo manual de puertos por
-  CDC, texto crudo de CDC0/CDC1, estado completo de lead-off/RLD y tabla granular de configuración).
-  Filtros notch/pasaaltos/pasabajos implementados en software (scipy.signal), no en firmware. Ver
-  sección "Herramienta PC" más abajo para el detalle completo.
+  interna simplificada), **"Análisis"** (carga offline de una grabación CSV previa, plot con
+  selección de rango arrastrable y recuadro de amplitud pico a pico, sin necesitar el equipo
+  conectado) y **"Avanzado"** (todo el detalle de debug: mapeo manual de puertos por CDC, texto
+  crudo de CDC0/CDC1, estado completo de lead-off/RLD y tabla granular de configuración). Filtros
+  notch/pasaaltos/pasabajos implementados en software (scipy.signal), no en firmware. Ver sección
+  "Herramienta PC" más abajo para el detalle completo.
 - **Streaming continuo multicore** de los 8 canales EMG + estado de lead-off por USB, y una **API de
   configuración completa** por CDC1 (ganancia, encendido de canales, modo HR/LP, RLD, test signals,
   mux de entrada, lead-off detection). Ver sección "Arquitectura de adquisición y streaming" más
@@ -312,8 +314,8 @@ decidió en sesión, sin un plan_*.md dedicado (ver este mismo `CLAUDE.md` para 
 
 ### Qué hace
 
-- Ventana con 3 pestañas (`QTabWidget`): **"Monitor"**, **"Señales de prueba"** y **"Avanzado"**.
-  Barra superior común a las 3: botones **"Conectar equipo"**/**"Desconectar equipo"** + label de
+- Ventana con 4 pestañas (`QTabWidget`): **"Monitor"**, **"Señales de prueba"**, **"Análisis"** y
+  **"Avanzado"**. Barra superior común a las 4: botones **"Conectar equipo"**/**"Desconectar equipo"** + label de
   estado agregado (verde = las 7 interfaces conectadas, ámbar = parcial, rojo = ninguna),
   **"Iniciar grabación"**/**"Detener grabación"** + label de estado (ver "Grabación a CSV" más
   abajo), y **"Pantalla completa (F11)"** (`MainWindow.toggle_fullscreen()`). La ventana arranca
@@ -323,18 +325,12 @@ decidió en sesión, sin un plan_*.md dedicado (ver este mismo `CLAUDE.md` para 
   (~80%):
   - Sidebar (`MainWindow._build_sidebar()`), sin ningún texto de nota que ocupe espacio de más —
     todo son controles:
-    - **"Canales"**: checkbox de visibilidad + combo de ganancia (`GAIN_VALUES`) + cartel de
-      lead-off (`channel_leadoff_labels`) por cada canal físico (1-8). Los 8 `SingleChannelPlot`
-      **siempre** existen y reciben datos (`append_batch`) aunque estén ocultos; destildar solo los
-      saca del área de plots y de `refresh_plots()`. El combo de ganancia manda `GAIN <ch> <valor>`
-      (`_on_sidebar_gain_changed`) y se mantiene sincronizado con el combo equivalente de
-      `ConfigPanel` en "Avanzado" en ambos sentidos (incluida una relectura real de configuración al
-      conectar, ver más abajo). El cartel de lead-off (texto "Desconectado" en rojo, vacío el resto
-      del tiempo) lo llena `MainWindow._update_leadoff_labels()` a partir de cada trama de CDC6
-      (`poll_process_queues`, tag `"rld"`) — mismo mapeo de bits que `RldStatusPanel.update_status`
-      en "Avanzado" (bit `ch-1` de `LOFF_STATP`/`LOFF_STATN`; canal desconectado si cualquiera de
-      los dos está en 1) — y solo mientras el checkbox "Lead-off activo" está tildado (si no, los
-      comparadores no están configurados para esos canales y los bits no reflejan nada real).
+    - **"Canales"**: checkbox de visibilidad + combo de ganancia (`GAIN_VALUES`) por cada canal
+      físico (1-8). Los 8 `SingleChannelPlot` **siempre** existen y reciben datos (`append_batch`)
+      aunque estén ocultos; destildar solo los saca del área de plots y de `refresh_plots()`. El
+      combo de ganancia manda `GAIN <ch> <valor>` (`_on_sidebar_gain_changed`) y se mantiene
+      sincronizado con el combo equivalente de `ConfigPanel` en "Avanzado" en ambos sentidos
+      (incluida una relectura real de configuración al conectar, ver más abajo).
     - **"Escala de los plots"**: combo Automática/Manual + spinbox+unidad para el eje X (s/ms) y
       para el eje Y (mV/µV/V). Ver "Escala de los plots" más abajo. **Importante para verificar
       filtros a ojo:** en modo Automática (el default) el autorange de pyqtgraph reescala el eje Y
@@ -343,7 +339,8 @@ decidió en sesión, sin un plan_*.md dedicado (ver este mismo `CLAUDE.md` para 
       igual aunque los mV cambiaron. Para confirmar que un filtro realmente está actuando, pasar a
       modo Manual con un rango Y fijo antes de activarlo/desactivarlo.
     - **"Filtros (canales visibles)"**: 3 combos — Notch (Apagado/50 Hz/60 Hz), Pasaaltos
-      (Apagado/20 Hz/50 Hz), Pasabajos (Apagado/150 Hz/500 Hz). Ver "Filtros de señal" más abajo.
+      (Apagado/1 Hz/20 Hz/50 Hz), Pasabajos (Apagado/125 Hz/150 Hz/500 Hz). Ver "Filtros de señal"
+      más abajo.
     - **"RLD / Lead-off"**: dos checkboxes ON/OFF simples, sin nada más. RLD manda primero
       `RLD_CH <ch> P/N 1` (ON) o `0` (OFF) para los 8 canales y recién después `RLD ON`/`RLD OFF`
       (`_on_rld_toggle`) — **bug real corregido:** antes solo mandaba `RLD ON/OFF`
@@ -355,7 +352,12 @@ decidió en sesión, sin un plan_*.md dedicado (ver este mismo `CLAUDE.md` para 
       `LOFF_TYPE`/`LOFF_CURRENT`/`LOFF_THRESHOLD`) que estén configurados en "Avanzado" (esa
       referencia solo vive en este `CLAUDE.md`, no como texto en la sidebar); ver también el bug de
       firmware corregido en `CONFIG4.PD_LOFF_COMP` (sección "Presupuesto de throughput USB") sin el
-      cual esto nunca funcionaba, sea cual sea la configuración de la GUI.
+      cual esto nunca funcionaba, sea cual sea la configuración de la GUI — **ese fix requiere
+      reflashear la placa; hasta no hacerlo, el lead-off sigue sin mostrar desconexiones aunque la
+      GUI ya esté corregida.**
+      El aviso de desconexión se muestra ahora en `SingleChannelPlot.set_leadoff()`, como un cartel
+      "Electrodo desconectado" bajo el título de cada canal en el área de plots — ver más abajo
+      ("Cartel de lead-off en cada plot") — no en la sidebar.
   - Área de plots (`MainWindow._rebuild_channel_grid()`): sin scrollbar — siempre se reparte para
     que los canales tildados entren en el espacio disponible, priorizando ver más escala horizontal
     (tiempo) que vertical:
@@ -374,6 +376,16 @@ decidió en sesión, sin un plan_*.md dedicado (ver este mismo `CLAUDE.md` para 
       `QGroupBox`, label de estado, ejes y ticks de pyqtgraph todos a ~9-10px, márgenes/spacing del
       layout interno recortados) para que hasta 4 canales apilados en una misma columna entren sin
       necesitar scroll. `MainWindow.pair_channels` rutea los batches de `poll_process_queues`.
+    - **Cartel de lead-off en cada plot** (`SingleChannelPlot.leadoff_label`, bajo el título "Canal
+      N"): vacío y sin fondo la mayor parte del tiempo; solo cuando `MainWindow._update_leadoff_status`
+      detecta ese canal desconectado (y "Lead-off activo" está tildado) se pinta en rojo con el texto
+      "Electrodo desconectado" (`SingleChannelPlot.set_leadoff()`). **Historial:** antes ahí se
+      mostraba el estado de conexión del CDC de datos ("Conectado a COMx"/"Desconectado",
+      `set_connected()`); se sacó porque confundía con lead-off y era redundante con el label
+      agregado de conexión en la barra superior. También existió brevemente un cartel de lead-off
+      aparte en la sidebar "Canales" (con fondo rojo fijo, visible aunque no hubiera desconexión
+      real) — se sacó por lo mismo y se consolidó acá, en el lugar donde el usuario ya esperaba ver
+      el estado de cada canal.
 - **"Señales de prueba"** (`TestSignalPanel`, clase nueva e independiente de `ConfigPanel`): combos
   `TESTSIG`/`TESTSIG_AMP`/`TESTSIG_FREQ` + botones `START`/`STOP`, y un checkbox por canal que manda
   `MUX <ch> TEST` (tildado) o `MUX <ch> NORMAL` (destildado) — versión simplificada del combo
@@ -382,6 +394,38 @@ decidió en sesión, sin un plan_*.md dedicado (ver este mismo `CLAUDE.md` para 
   independiente del `ConfigPanel` de "Avanzado", cambiar TESTSIG/MUX desde un lado no actualiza
   visualmente los controles equivalentes del otro (ambos solo mandan comandos "fire and forget",
   igual que el resto de la API de CDC1).
+- **"Análisis"** (`RecordingAnalysisPanel`, pestaña nueva e independiente de la adquisición en
+  vivo): carga un CSV grabado por "Iniciar grabación" (mismo formato tidy `tiempo_s,canal,mV`, ver
+  "Grabación a CSV" más abajo) para revisarlo offline, sin necesitar el equipo conectado. Layout
+  `QHBoxLayout` con el plot a la izquierda (~80%, `stretch=4`) y un recuadro a la derecha (~20%,
+  `stretch=1`, mismo criterio de reparto que el `QSplitter` 20/80 de "Monitor"):
+  - Botón **"Cargar grabación..."** (`QFileDialog.getOpenFileName`) + label con el nombre del
+    archivo (path completo como tooltip, igual criterio que el label de grabación de la barra
+    superior). `RecordingAnalysisPanel._read_tidy_csv()` parsea el CSV con el módulo `csv` (sin
+    pandas, no es una dependencia del proyecto) agrupando filas por canal y ordenando por
+    `tiempo_s` (defensivo: las filas de un mismo canal ya vienen ordenadas por tiempo en el archivo,
+    ver `MainWindow._record_batch`, pero un archivo editado a mano podría no estarlo). Para archivos
+    muy largos (varios minutos a 8 kSPS) el parseo fila a fila en Python puede tardar unos segundos;
+    se muestra cursor de espera (`QApplication.setOverrideCursor(WaitCursor)`, mismo patrón que
+    `_auto_assign_ports`) mientras carga.
+  - Combo **"Canal"**: se llena con los canales presentes en el archivo cargado (no asume los 8 —
+    depende de qué canales estuvieran tildados al grabar). Al cambiar de canal se replotea la serie
+    completa y la región de selección se resetea a todo el rango de tiempo de ese canal.
+  - El plot (`pg.PlotWidget`) tiene una región arrastrable (`pg.LinearRegionItem`, orientación
+    vertical por defecto) superpuesta: se selecciona el rango en el eje X arrastrando sus dos bordes
+    con el mouse directamente sobre la señal, sin tipear números. Al cargar un archivo o cambiar de
+    canal arranca cubriendo todo el rango. Botón **"Ver todo el rango"** la resetea en cualquier
+    momento.
+  - Recuadro **"Amplitud del rango seleccionado"**: `_on_region_changed()` (conectado a
+    `region.sigRegionChanged`) recalcula en vivo, mientras se arrastra la región, sobre las muestras
+    del canal actual dentro de `[xmin, xmax]` (búsqueda binaria con `np.searchsorted` sobre el array
+    de tiempo ya ordenado), dos valores en labels grandes junto con el rango seleccionado en
+    segundos:
+    - **Pico a pico**: `max(mV) - min(mV)`.
+    - **RMS**: `sqrt(mean(mV^2))` — fórmula estándar para una señal discreta `x[n]` con `N`
+      muestras dentro de la ventana (`RMS = sqrt((1/N) * sum(x[n]^2))`), la misma que la mayoría de
+      los papers de EMG usan para cuantificar la actividad muscular en una ventana de tiempo.
+      Validado con un caso conocido (onda cuadrada de amplitud A -> RMS = A exacto).
 - **"Avanzado"** (todo lo que antes era la UI principal, sin recortar nada): botones "Buscar
   puertos"/"Auto-detectar CDC"/"Conectar seleccionados"/"Desconectar todo" + spinbox de baudrate +
   tabla de asignación manual de puerto COM por CDC; `CdcPanel` de texto crudo para CDC0/CDC1;
@@ -414,6 +458,8 @@ de CDC1 que siguen aplicándose en hardware).
   `MainWindow._on_filter_changed()` recalcula el SOS y lo propaga con `set_filter()` a
   `self.visible_channels`; `_rebuild_channel_grid()` también llama `set_filter()` sobre los
   canales que pasan a visibles, para que un canal recién tildado ya aparezca filtrado.
+- **Cortes disponibles** (`MainWindow._NOTCH_HZ`/`_HPF_HZ`/`_LPF_HZ`): Notch Apagado/50/60 Hz;
+  Pasaaltos Apagado/1/20/50 Hz; Pasabajos Apagado/125/150/500 Hz.
 
 ### Escala de los plots (sidebar "Escala de los plots")
 
