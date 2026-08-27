@@ -1414,8 +1414,8 @@ class ProcessConnection:
 class MainWindow(QMainWindow):
     # Combos de la sidebar de filtros -> parámetro de build_filter_sos().
     _NOTCH_HZ = {"Apagado": None, "50 Hz": 50, "60 Hz": 60}
-    _HPF_HZ = {"Apagado": None, "1 Hz": 1, "20 Hz": 20, "50 Hz": 50}
-    _LPF_HZ = {"Apagado": None, "125 Hz": 125, "150 Hz": 150, "500 Hz": 500}
+    _HPF_HZ = {"Apagado": None, "1 Hz": 1, "2 Hz": 2, "5 Hz": 5, "10 Hz": 10, "20 Hz": 20, "50 Hz": 50}
+    _LPF_HZ = {"Apagado": None, "100 Hz": 100, "125 Hz": 125, "150 Hz": 150, "500 Hz": 500}
 
     # Combos de unidad de la sidebar "Escala de los plots" -> factor de
     # conversión a las unidades internas (segundos / mV).

@@ -79,6 +79,15 @@ implementado en `ads1298::init()`.
 - ID esperado del registro ID (0x00): **0x92** para el ADS1298 (ya usado como
   `EXPECTED_ID_ADS1298` en el código). Formato del ID: bits[7:5] = familia de dispositivo,
   bits[2:0] = número de canales (010 = 8 canales → ADS1298/ADS1298R).
+- **Filtro EMI de entrada: siempre activo, no es configurable.** Datasheet, sección 9.3.1.1 "EMI
+  Filter" (p. 26): "An RC filter at the input acts as an EMI filter on all channels. The –3-dB
+  filter bandwidth is approximately 3 MHz." Es un filtro RC pasivo cableado en el silicio, uno por
+  canal, sin ningún bit de registro que lo habilite/deshabilite ni que aparezca en `ads1298.h` — no
+  hay nada que el firmware necesite hacer para "activarlo", ya está funcionando por diseño. Su
+  ancho de banda (~3 MHz) está muy por encima de cualquier corte de los filtros de software de la
+  GUI (notch/pasaaltos/pasabajos hasta 500 Hz, ver "Filtros de señal" más abajo) o del propio
+  data rate del ADC (hasta 8 kSPS): no tiene ningún efecto perceptible sobre la señal EMG, sirve
+  para atenuar interferencia de radiofrecuencia muy por fuera de la banda de interés.
 
 #### Comandos SPI (opcodes) — ya definidos en `ads1298.h`
 
@@ -339,8 +348,8 @@ decidió en sesión, sin un plan_*.md dedicado (ver este mismo `CLAUDE.md` para 
       igual aunque los mV cambiaron. Para confirmar que un filtro realmente está actuando, pasar a
       modo Manual con un rango Y fijo antes de activarlo/desactivarlo.
     - **"Filtros (canales visibles)"**: 3 combos — Notch (Apagado/50 Hz/60 Hz), Pasaaltos
-      (Apagado/1 Hz/20 Hz/50 Hz), Pasabajos (Apagado/125 Hz/150 Hz/500 Hz). Ver "Filtros de señal"
-      más abajo.
+      (Apagado/1 Hz/2 Hz/5 Hz/10 Hz/20 Hz/50 Hz), Pasabajos (Apagado/100 Hz/125 Hz/150 Hz/500 Hz).
+      Ver "Filtros de señal" más abajo.
     - **"RLD / Lead-off"**: dos checkboxes ON/OFF simples, sin nada más. RLD manda primero
       `RLD_CH <ch> P/N 1` (ON) o `0` (OFF) para los 8 canales y recién después `RLD ON`/`RLD OFF`
       (`_on_rld_toggle`) — **bug real corregido:** antes solo mandaba `RLD ON/OFF`
@@ -459,7 +468,7 @@ de CDC1 que siguen aplicándose en hardware).
   `self.visible_channels`; `_rebuild_channel_grid()` también llama `set_filter()` sobre los
   canales que pasan a visibles, para que un canal recién tildado ya aparezca filtrado.
 - **Cortes disponibles** (`MainWindow._NOTCH_HZ`/`_HPF_HZ`/`_LPF_HZ`): Notch Apagado/50/60 Hz;
-  Pasaaltos Apagado/1/20/50 Hz; Pasabajos Apagado/125/150/500 Hz.
+  Pasaaltos Apagado/1/2/5/10/20/50 Hz; Pasabajos Apagado/100/125/150/500 Hz.
 
 ### Escala de los plots (sidebar "Escala de los plots")
 
