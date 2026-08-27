@@ -45,6 +45,14 @@ Implementado:
 Pendiente:
 - Sin pruebas en hardware todavía de la nueva arquitectura de streaming ni del GUI actualizado
   (recién implementados; falta la validación en 3 etapas descrita en "Próximos pasos").
+- **Crítico, sesión 2026-08-22:** se corrigió un bug real grave — el SPI hacia el ADS1298 corría a
+  1 MHz, insuficiente para sostener 8 kSPS (ver "Presupuesto de throughput SPI"), causando que la
+  tasa real de muestreo fuera ~4367 SPS en vez de los 8000 SPS asumidos por toda la GUI. Esto
+  producía un eje de tiempo comprimido (~1.83×) y una FFT con las frecuencias corridas al doble
+  (p. ej. 50 Hz de red apareciendo cerca de 100 Hz) — exactamente el síntoma reportado con un ECG
+  real (complejos QRS "demasiado juntos"). Fix: SPI subido a 4 MHz. **Falta reflashear la placa y
+  volver a grabar una señal de frecuencia conocida (ECG real o generador) para confirmar que el
+  intervalo RR y la FFT ahora son correctos.**
 
 ## Hardware
 
@@ -166,6 +174,85 @@ diseño original (con el contexto completo de las decisiones tomadas) quedó gua
 - Si en el futuro se cambia el mapeo de canales por CDC o el número de interfaces de datos, hay que
   actualizar `DATA_CDC_COUNT` en `usb_manager.cpp` y los índices fijos usados en
   `acquisition_core1_entry()`.
+
+### Presupuesto de throughput SPI (RP2040 ↔ ADS1298) — bug real grave corregido
+
+**Bug encontrado en sesión 2026-08-22, a partir de un síntoma clínico real**: el usuario registró un
+ECG y notó los complejos QRS "demasiado juntos" (frecuencia cardíaca aparente absurdamente alta para
+una persona en reposo) y picos de FFT muy grandes cerca de 100 Hz y 200 Hz que desaparecían al activar
+RLD (es decir, armónicos de la red eléctrica de 50 Hz, pero aparentando el doble de su frecuencia
+real). Ambos síntomas son la firma clásica de un **factor de escala en la tasa de muestreo real vs.
+la asumida por el software** (si el software cree que muestrea a 8000 SPS pero en realidad muestrea a
+~4000 SPS, un intervalo real de 0.8 s se dibuja como 0.4 s, y un tono real de 50 Hz aparece en el
+bin de 100 Hz de la FFT).
+
+**Causa raíz confirmada**: `ads1298::init()` inicializaba el SPI a **1 MHz**
+(`spi_baudrate_hz = 1000*1000`, valor por defecto histórico), pero a esa velocidad el bus SPI no
+puede sostener físicamente el data rate de 8 kSPS configurado en `CONFIG1`:
+
+- `readDataFrame()` transfiere 28 bytes por muestra (1 byte de opcode `RDATA` + 3 bytes de status
+  word + 8 canales × 3 bytes).
+- **Ancho de banda SPI mínimo requerido** a 8000 SPS: `28 bytes × 8 bits × 8000 SPS = 1 792 000 bps`
+  (1.792 Mbps), **con cero margen para ningún otro overhead**.
+- **Ancho de banda SPI disponible a 1 MHz**: 1 000 000 bps — **menor que el mínimo teórico
+  necesario**, incluso antes de contar el `sleep_us(5)` que hay después de cada transacción en
+  `readDataFrame()`.
+- Tiempo real por muestra a 1 MHz: `224 µs` (transferencia) + `5 µs` (sleep) = **~229 µs**, contra un
+  período de DRDY de apenas **125 µs** a 8 kSPS real. El loop de polling en
+  `acquisition_core1_entry()` (`src/acquisition.cpp`) nunca llegaba a leer cada conversión a tiempo.
+- El ADS1298 **no tiene FIFO**: su registro de salida solo guarda la conversión más reciente: las
+  muestras que no se alcanzan a leer antes de la siguiente conversión se pierden calladamente, sin
+  ningún error de SPI ni de framing — el `queue_try_add()` del lado del firmware y el
+  `extract_frames()` del lado de la GUI (ver más abajo) nunca ven nada anormal, porque desde su
+  perspectiva cada trama que sí llega está perfectamente bien formada; sencillamente llegan **menos
+  tramas por segundo de las que debería haber**.
+- **Tasa real efectivamente alcanzada**: `1 000 000 / 229 ≈ 4367 SPS` — muy cerca de la mitad de los
+  8000 SPS que asume `SingleChannelPlot.ASSUMED_SAMPLE_RATE` en toda la GUI (factor de compresión
+  temporal ≈ 1.83×), consistente con los síntomas reportados: un intervalo RR real de ~800 ms se
+  dibuja como ~437 ms (< 500 ms, exactamente lo que se observó), y un tono real de 50 Hz cae cerca
+  del bin de ~92-100 Hz en la FFT.
+- **Por qué antes "funcionaba" con la test signal y señales lentas**: a baja frecuencia de la señal
+  de interés, perder ~55% de las muestras y estirar el eje de tiempo no se nota a simple vista; recién
+  se hizo evidente con una señal real de frecuencia conocida (el ritmo cardíaco) y con la FFT, que
+  expone directamente el eje de frecuencias mal escalado.
+
+**Fix aplicado**: subir el SPI a **4 MHz** (`ads1298::init(uint32_t spi_baudrate_hz = 4*1000*1000)`
+en `inc/ads1298.h`/`src/ads1298.cpp`). A 4 MHz cada frame tarda `56 µs + 5 µs ≈ 61 µs`, dejando
+**~64 µs de margen** sobre el período de DRDY de 125 µs (factor de seguridad ~2×). El ADS1298 soporta
+SCLK de hasta **20 MHz** (datasheet, sección 7.6 "Timing Requirements: Serial Interface", `tSCLK` mín.
+= 50 ns), así que 4 MHz además deja amplio margen respecto del límite del propio chip. `init()` ahora
+devuelve el baudrate real logrado (`spi_init()` de Pico SDK ajusta al divisor de reloj más cercano
+disponible, no siempre exactamente el pedido), y `EMG.cpp` lo loguea por `CDC_DEBUG` al arrancar
+(`"SPI ADS1298 a <N> Hz"`) para poder confirmar en hardware qué quedó configurado realmente.
+
+**Verificado que NO hay ningún otro factor de escala sumado a este** (se revisó explícitamente para
+descartar bugs de conteo multicanal, ver checklist de la sesión):
+- El registro `CONFIG1` (`DR=010b` + `HR=1`) sí mapea correctamente a 8000 SPS según la Tabla 1 del
+  datasheet ("Input-Referred Noise... High-Resolution Mode") — la configuración del ADC en sí es
+  correcta; el problema era exclusivamente la velocidad de lectura por SPI, no la tasa de conversión
+  interna del chip.
+- Cada `readDataFrame()` trae los 8 canales de una muestra simultánea en una sola transacción (el
+  ADS1298 es de muestreo simultáneo) y cada trama USB (`extract_frames()`/`decode_data_frame()` en
+  `emg_multicdc_gui.py`) decodifica exactamente 2 valores por trama, uno por canal, sin ningún
+  factor de multiplicación/división oculto — no hay confusión entre "tramas recibidas" y "muestras
+  temporales".
+- Un único punto de verdad para la tasa de muestreo en todo el software Python:
+  `SingleChannelPlot.ASSUMED_SAMPLE_RATE = 8000`, referenciado consistentemente por el eje de tiempo
+  de los plots en vivo (`refresh()`), el timestamp grabado en el CSV (`_record_batch()`), el diseño
+  de los filtros (`build_filter_sos()`) y el eje de frecuencias de la FFT en "Análisis"
+  (`_update_fft_plot()`, `np.fft.rfftfreq(n, d=1.0/fs)`) — todos usan la misma constante, así que
+  antes del fix todos estaban mal en la misma dirección y por el mismo factor (consistente con ver
+  el mismo problema reflejado tanto en el dominio del tiempo como en la FFT), y después del fix del
+  SPI, corregir la tasa real de adquisición corrige ambos ejes a la vez sin tocar nada del lado
+  Python.
+
+**Pendiente**: falta compilar (ya compila limpio, `cmake --build build` verificado), **reflashear la
+placa** y volver a grabar una señal real (ECG o generador con frecuencia conocida) para confirmar que
+el intervalo RR y la FFT ahora coinciden con la realidad. Si al reflashear con SPI a 4 MHz aparecen
+datos corruptos/ruido excesivo (indicio de mala señal íntegra por cableado largo o de baja calidad en
+protoboard), bajar el baudrate a un valor intermedio (p. ej. 2 MHz da ~117 µs/muestra, con apenas 8 µs
+de margen — ajustado pero funcional; probar primero a 4 MHz y solo bajar si hay problemas de
+integridad de señal, nunca volver a 1 MHz).
 
 ### Presupuesto de throughput USB (validado)
 
@@ -435,8 +522,9 @@ decidió en sesión, sin un plan_*.md dedicado (ver este mismo `CLAUDE.md` para 
       muestras dentro de la ventana (`RMS = sqrt((1/N) * sum(x[n]^2))`), la misma que la mayoría de
       los papers de EMG usan para cuantificar la actividad muscular en una ventana de tiempo.
       Validado con un caso conocido (onda cuadrada de amplitud A -> RMS = A exacto).
-  - Segundo plot debajo del de tiempo: **espectro de frecuencia (FFT)** de la misma porción
-    seleccionada, recalculado en vivo en `_update_fft_plot()` cada vez que cambia la región
+  - Segundo plot debajo del de tiempo, mismo alto (`left.addWidget(..., stretch=1)` para ambos, 50/50
+    del alto disponible en la columna izquierda): **espectro de frecuencia (FFT)** de la misma
+    porción seleccionada, recalculado en vivo en `_update_fft_plot()` cada vez que cambia la región
     (`_on_region_changed()`, mismo disparador que pico a pico/RMS). Eje X en Hz (limitado a
     `[0, fs/2]` por `np.fft.rfftfreq`), eje Y en mV. Se asume `fs = SingleChannelPlot.
     ASSUMED_SAMPLE_RATE` (8000), igual que el resto de la GUI, porque `tiempo_s` en el CSV es un
@@ -582,6 +670,20 @@ se perdió alguna respuesta).
   ganancia cambió hace poco, las muestras más viejas que quedan en el buffer circular se dibujan con
   la ganancia *actual*, no con la que tenían en el momento de la captura — aproximación aceptable
   para visualización, no para medición de precisión (ver "Próximos pasos").
+- **Cambiar la ganancia NO debería cambiar la amplitud en mV que se ve en pantalla — es el
+  comportamiento esperado, no un bug.** La fórmula divide por `Gain`, así que para el mismo voltaje
+  físico de entrada, un código ADC crudo proporcionalmente más grande (a mayor ganancia, el PGA
+  amplifica más antes de digitalizar) se traduce de vuelta al mismo valor en mV: el propósito de
+  dividir por la ganancia es justamente mostrar siempre el voltaje real de entrada,
+  independientemente de cómo esté configurado el PGA. Lo que sí cambia con la ganancia es la
+  resolución efectiva del ADC para ese voltaje (más ganancia = más códigos por mV = menos ruido de
+  cuantización, hasta el punto de saturar si la ganancia es demasiado alta para la amplitud real de
+  la señal) — un efecto interno, no visible como un cambio de tamaño de la traza. Verificado
+  numéricamente: mismo voltaje de entrada a ganancias 1/2/3/4/6/8/12 → mismo mV mostrado en los
+  siete casos. Para confirmar a ojo que el comando `GAIN` sí llegó al ADS1298, usar el botón
+  "Releer configuración actual del ADS1298" en "Avanzado" (lee `CHnSET` de vuelta por SPI) en vez de
+  buscar un cambio de amplitud en el plot. Ver también la nota histórica de la test signal interna,
+  más abajo, que es un caso particular de este mismo principio.
 
 **Nota histórica — amplitud real de la test signal interna:** la test signal interna del ADS1298
 (`TESTSIG ON`) es de amplitud **muy chica**: `CONFIG2.TEST_AMP` da ±1 mV (código 0) o ±2 mV (código
@@ -700,6 +802,22 @@ COM9→CDC3, COM10→CDC0), confirmando que la detección por banner es necesari
 
 ## Próximos pasos sugeridos (a partir de lo que falta)
 
+0. **(Prioridad máxima, sesión 2026-08-22) Reflashear y validar el fix del SPI a 4 MHz.** Ver
+   "Presupuesto de throughput SPI (RP2040 ↔ ADS1298)" más arriba para el detalle completo del bug
+   (SPI a 1 MHz insostenible a 8 kSPS → tasa real ~4367 SPS → eje de tiempo comprimido ~1.83× y FFT
+   con frecuencias duplicadas). Validación sugerida:
+   1. Reflashear la placa con el firmware ya compilado (`build/EMG.elf` / `.uf2`).
+   2. Revisar el mensaje `"SPI ADS1298 a <N> Hz"` por CDC0 (Debug) al arrancar — confirmar que el
+      valor logueado esté cerca de 4 MHz (puede no ser exactamente 4 000 000 por el divisor de reloj
+      del RP2040, pero debe estar en ese orden, no en 1 MHz).
+   3. Repetir la prueba que expuso el bug: grabar un ECG (o, mejor para verificar sin ambigüedad, un
+      generador de señales con una frecuencia conocida, p. ej. una onda de 1 Hz o 10 Hz) y confirmar
+      en la pestaña "Análisis" que el intervalo entre eventos y el pico de la FFT ahora caen en la
+      frecuencia real esperada (ya no al doble).
+   4. Si aparece ruido/datos corruptos que no estaban antes (posible problema de integridad de señal
+      por cableado en protoboard a 4 MHz), bajar el baudrate por pasos (ver el argumento
+      `spi_baudrate_hz` de `ads1298::init()` en `EMG.cpp`) hasta encontrar el punto estable más alto
+      — nunca volver a 1 MHz, que es insuficiente por diseño para 8 kSPS.
 1. **Validar en hardware la nueva arquitectura de streaming**, en el orden acordado (ahora se puede
    hacer directamente con `emg_multicdc_gui.py`, que ya decodifica y grafica los frames binarios):
    1. Test signals internas: desde la pestaña "Señales de prueba" (`TestSignalPanel`), activar

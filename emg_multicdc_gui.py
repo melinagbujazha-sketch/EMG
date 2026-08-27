@@ -1227,7 +1227,7 @@ class RecordingAnalysisPanel(QWidget):
         self.region.sigRegionChanged.connect(self._on_region_changed)
         self.plot_widget.addItem(self.region)
 
-        left.addWidget(self.plot_widget, stretch=3)
+        left.addWidget(self.plot_widget, stretch=1)
 
         # Espectro de frecuencia (FFT) de la porción seleccionada en el
         # plot de tiempo de arriba (ver _update_fft_plot). Eje X limitado
@@ -1240,7 +1240,7 @@ class RecordingAnalysisPanel(QWidget):
         self.fft_plot_widget.setLabel("bottom", "Frecuencia (Hz)")
         self.fft_plot_widget.setTitle("Espectro de frecuencia (FFT) del rango seleccionado")
         self.fft_curve = self.fft_plot_widget.plot(pen=pg.mkPen("c", width=1))
-        left.addWidget(self.fft_plot_widget, stretch=2)
+        left.addWidget(self.fft_plot_widget, stretch=1)
 
         root.addLayout(left, stretch=4)
 

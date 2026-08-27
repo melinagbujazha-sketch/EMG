@@ -57,7 +57,7 @@ int main(void)
     // Espera corta para que la PC llegue a enumerar los CDC USB.
     sleep_ms(3000);
 
-    ads.init();
+    uint32_t spi_hz = ads.init();
     ads.reset();
 
     uint8_t id = ads.readId();
@@ -65,6 +65,13 @@ int main(void)
     emg_usb_write_line(CDC_DEBUG, "Iniciando firmware EMG...");
 
     char msg[64];
+    // SPI a 4 MHz nominal (ver ads1298.h: init(), bug real corregido de un
+    // SPI a 1 MHz que no alcanzaba a sostener 8 kSPS). Loguea el valor real
+    // que RP2040 logró (el divisor de reloj puede no dar exactamente lo
+    // pedido) para confirmar en hardware que el fix quedó bien aplicado.
+    snprintf(msg, sizeof(msg), "SPI ADS1298 a %lu Hz", (unsigned long)spi_hz);
+    emg_usb_write_line(CDC_DEBUG, msg);
+
     snprintf(msg, sizeof(msg), "ID leido del ADS1298: 0x%02X", id);
     emg_usb_write_line(CDC_DEBUG, msg);
 

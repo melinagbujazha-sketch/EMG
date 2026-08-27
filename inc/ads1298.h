@@ -21,7 +21,42 @@ public:
             uint pin_start = 22,
             uint pin_pwdn = 26);
 
-    void init(uint32_t spi_baudrate_hz = 1000 * 1000);
+    // Baudrate SPI por defecto: 4 MHz. Bug real corregido — el valor
+    // anterior (1 MHz) era MENOR que el mínimo teórico necesario para
+    // sostener 8000 SPS con readDataFrame() (28 bytes/frame: 1 opcode +
+    // 3 status + 8 canales x 3 bytes):
+    //   bits requeridos = 28 * 8 * 8000 SPS = 1 792 000 bps (1.792 Mbps)
+    //   bits disponibles a 1 MHz            = 1 000 000 bps
+    // Con 1 MHz, cada readDataFrame() tardaba ~229 us (224 us de
+    // transferencia SPI + 5 us de sleep tras CS alto) contra un período de
+    // DRDY de apenas 125 us a 8 kSPS real — el loop de polling de
+    // acquisition_core1_entry() nunca llegaba a leer cada muestra a
+    // tiempo. El ADS1298 solo actualiza su registro de salida con la
+    // conversión más reciente (no hay FIFO), así que las muestras que no
+    // se llegan a leer antes de la siguiente conversión se pierden sin
+    // ningún error visible por SPI. Efecto medido: tasa real alcanzada
+    // ~4367 SPS en vez de los 8000 SPS asumidos en toda la GUI (factor de
+    // compresión temporal ~1.83x) — esto es exactamente lo que produce
+    // complejos QRS "demasiado juntos" en el plot y picos de FFT
+    // duplicados en frecuencia (p. ej. 50 Hz de red apareciendo cerca de
+    // 100 Hz), porque el eje de tiempo/frecuencia de la GUI (`ASSUMED_
+    // SAMPLE_RATE = 8000` en emg_multicdc_gui.py) asume una tasa que el
+    // firmware nunca estaba entregando de verdad.
+    // A 4 MHz, cada frame tarda ~61 us (56 us de transferencia + 5 us de
+    // sleep), dejando ~64 us de margen sobre el período de DRDY de 125 us
+    // — el ADS1298 soporta SCLK de hasta 20 MHz (datasheet, sección 7.6
+    // "Timing Requirements: Serial Interface", tSCLK mín. = 50 ns), así
+    // que 4 MHz deja además amplio margen de la capacidad del chip.
+    // IMPORTANTE: este fix requiere reflashear la placa para tener efecto;
+    // además, valida en hardware que la señal SPI a 4 MHz llegue limpia
+    // (sin ringing/reflexiones) dado el cableado real usado — si el
+    // cableado es largo o de mala calidad, subir aún más el baudrate podría
+    // introducir errores de bit en vez de resolverlos.
+    //
+    // Devuelve el baudrate real logrado (spi_init() ajusta al divisor de
+    // reloj más cercano disponible), útil para loguearlo por CDC_DEBUG y
+    // confirmar en hardware qué SPI clock quedó configurado realmente.
+    uint32_t init(uint32_t spi_baudrate_hz = 4 * 1000 * 1000);
     void reset();
 
     void sendCommand(uint8_t command);

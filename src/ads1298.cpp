@@ -21,9 +21,9 @@ ads1298::ads1298(spi_inst_t *spi_port,
 {
 }
 
-void ads1298::init(uint32_t spi_baudrate_hz)
+uint32_t ads1298::init(uint32_t spi_baudrate_hz)
 {
-    spi_init(_spi, spi_baudrate_hz);
+    uint32_t actual_baudrate_hz = spi_init(_spi, spi_baudrate_hz);
 
     gpio_set_function(_pin_miso, GPIO_FUNC_SPI);
     gpio_set_function(_pin_sck,  GPIO_FUNC_SPI);
@@ -54,6 +54,8 @@ void ads1298::init(uint32_t spi_baudrate_hz)
     mutex_init(&_bus_mutex);
 
     sleep_ms(100);
+
+    return actual_baudrate_hz;
 }
 
 void ads1298::reset()
