@@ -59,8 +59,10 @@ Interfaz clínica (3 pestañas):
 
     "Análisis" (RecordingAnalysisPanel) carga offline un CSV grabado por
     "Iniciar grabación" (no requiere el equipo conectado), lo grafica por
-    canal y muestra la amplitud pico a pico (max mV - min mV) del rango de
-    tiempo seleccionado arrastrando una región sobre el propio plot.
+    canal y muestra la amplitud pico a pico (max mV - min mV) y el RMS del
+    rango de tiempo seleccionado arrastrando una región sobre el propio
+    plot, más un segundo plot debajo con el espectro de frecuencia (FFT,
+    ventana de Hann) de esa misma porción seleccionada.
 
     "Avanzado" concentra todo lo que antes era la UI de debug, sin recortar
     funcionalidad: mapeo manual de puertos por CDC, paneles de texto crudo de
@@ -1179,7 +1181,12 @@ class RecordingAnalysisPanel(QWidget):
     discreta x[n] con N muestras: RMS = sqrt((1/N) * sum(x[n]^2))). Ese
     rango se elige arrastrando los bordes de una región (pg.LinearRegionItem)
     superpuesta al plot -- no hace falta tipear números; el rango completo
-    del canal se ve al cargar el archivo o al tocar "Ver todo el rango"."""
+    del canal se ve al cargar el archivo o al tocar "Ver todo el rango".
+
+    Debajo del plot de tiempo hay un segundo plot con el espectro de
+    frecuencia (FFT) de esa misma porción seleccionada (ver
+    _update_fft_plot), recalculado en vivo mientras se arrastra la
+    región."""
 
     def __init__(self):
         super().__init__()
@@ -1220,7 +1227,21 @@ class RecordingAnalysisPanel(QWidget):
         self.region.sigRegionChanged.connect(self._on_region_changed)
         self.plot_widget.addItem(self.region)
 
-        left.addWidget(self.plot_widget)
+        left.addWidget(self.plot_widget, stretch=3)
+
+        # Espectro de frecuencia (FFT) de la porción seleccionada en el
+        # plot de tiempo de arriba (ver _update_fft_plot). Eje X limitado
+        # por rfftfreq a [0, fs/2] (Nyquist); no tiene región propia, se
+        # recalcula en cada cambio de la región del plot de tiempo.
+        self.fft_plot_widget = pg.PlotWidget()
+        self.fft_plot_widget.setBackground("k")
+        self.fft_plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        self.fft_plot_widget.setLabel("left", "Amplitud (mV)")
+        self.fft_plot_widget.setLabel("bottom", "Frecuencia (Hz)")
+        self.fft_plot_widget.setTitle("Espectro de frecuencia (FFT) del rango seleccionado")
+        self.fft_curve = self.fft_plot_widget.plot(pen=pg.mkPen("c", width=1))
+        left.addWidget(self.fft_plot_widget, stretch=2)
+
         root.addLayout(left, stretch=4)
 
         # ---- Columna derecha: selección de canal + amplitud pico a pico ----
@@ -1364,9 +1385,42 @@ class RecordingAnalysisPanel(QWidget):
             rms = float(np.sqrt(np.mean(np.square(segment))))
             self.p2p_label.setText(f"{p2p:.4f} mV")
             self.rms_label.setText(f"{rms:.4f} mV")
+            self._update_fft_plot(segment)
         else:
             self.p2p_label.setText("- mV")
             self.rms_label.setText("- mV")
+            self.fft_curve.setData([], [])
+
+    def _update_fft_plot(self, segment: np.ndarray):
+        """Espectro de amplitud (FFT de un solo lado) de la porción de
+        señal seleccionada. Se asume fs = SingleChannelPlot.ASSUMED_SAMPLE_RATE
+        (8000, igual al resto de la GUI y al cap de firmware), ya que
+        tiempo_s en el CSV es un contador de muestras a esa tasa, no un
+        timestamp real (ver docstring de MainWindow._start_recording).
+
+        Se aplica una ventana de Hann antes de la FFT para reducir el
+        "leakage" espectral que produciría una ventana rectangular (los
+        bordes del rango seleccionado son arbitrarios, no necesariamente un
+        número entero de períodos de la señal). La amplitud se corrige por
+        la ganancia coherente de la ventana (2/sum(window)) para que un
+        tono puro de amplitud A dentro del rango se vea como un pico de
+        altura ~A en el espectro, en vez de una fracción arbitraria."""
+        n = len(segment)
+        if n < 2:
+            self.fft_curve.setData([], [])
+            return
+
+        fs = SingleChannelPlot.ASSUMED_SAMPLE_RATE
+        window = np.hanning(n)
+        spectrum = np.fft.rfft(segment * window)
+        freqs = np.fft.rfftfreq(n, d=1.0 / fs)
+
+        amplitude = np.abs(spectrum) * (2.0 / window.sum())
+        amplitude[0] /= 2.0  # DC: no se duplica, no tiene componente espejo
+        if n % 2 == 0:
+            amplitude[-1] /= 2.0  # bin de Nyquist: tampoco tiene espejo
+
+        self.fft_curve.setData(freqs, amplitude)
 
 
 # ==================================================

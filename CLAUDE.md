@@ -435,6 +435,20 @@ decidió en sesión, sin un plan_*.md dedicado (ver este mismo `CLAUDE.md` para 
       muestras dentro de la ventana (`RMS = sqrt((1/N) * sum(x[n]^2))`), la misma que la mayoría de
       los papers de EMG usan para cuantificar la actividad muscular en una ventana de tiempo.
       Validado con un caso conocido (onda cuadrada de amplitud A -> RMS = A exacto).
+  - Segundo plot debajo del de tiempo: **espectro de frecuencia (FFT)** de la misma porción
+    seleccionada, recalculado en vivo en `_update_fft_plot()` cada vez que cambia la región
+    (`_on_region_changed()`, mismo disparador que pico a pico/RMS). Eje X en Hz (limitado a
+    `[0, fs/2]` por `np.fft.rfftfreq`), eje Y en mV. Se asume `fs = SingleChannelPlot.
+    ASSUMED_SAMPLE_RATE` (8000), igual que el resto de la GUI, porque `tiempo_s` en el CSV es un
+    contador de muestras a esa tasa y no un timestamp real (ver "Grabación a CSV"). Se aplica una
+    ventana de Hann antes de la FFT (`np.hanning`) para reducir el leakage espectral que produciría
+    una ventana rectangular — los bordes de la región seleccionada son arbitrarios, no
+    necesariamente un número entero de períodos de la señal — y la amplitud resultante se corrige
+    por la ganancia coherente de esa ventana (`2/sum(window)`, con los bines de DC y Nyquist sin
+    duplicar) para que un tono puro de amplitud A dentro del rango aparezca como un pico de altura
+    ~A en el espectro. Validado con una señal sintética (tonos de 60 Hz/4 mV y 300 Hz/1 mV + DC de
+    1.5 mV): los tres picos aparecen en la frecuencia y amplitud exactas. Con una selección de menos
+    de 2 muestras (o vacía) la curva de FFT se limpia en vez de crashear.
 - **"Avanzado"** (todo lo que antes era la UI principal, sin recortar nada): botones "Buscar
   puertos"/"Auto-detectar CDC"/"Conectar seleccionados"/"Desconectar todo" + spinbox de baudrate +
   tabla de asignación manual de puerto COM por CDC; `CdcPanel` de texto crudo para CDC0/CDC1;
