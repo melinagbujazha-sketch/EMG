@@ -1186,7 +1186,14 @@ class RecordingAnalysisPanel(QWidget):
     Debajo del plot de tiempo hay un segundo plot con el espectro de
     frecuencia (FFT) de esa misma porción seleccionada (ver
     _update_fft_plot), recalculado en vivo mientras se arrastra la
-    región."""
+    región. Su escala (recuadro "Escala del espectro (FFT)") se puede fijar
+    a mano igual que en la sidebar "Escala de los plots" de "Monitor", ver
+    _on_fft_scale_changed."""
+
+    # Combo de unidad del recuadro "Escala del espectro (FFT)" -> factor de
+    # conversión a la unidad interna (mV), igual valores que
+    # MainWindow._Y_UNIT_TO_MV.
+    _FFT_Y_UNIT_TO_MV = {"mV": 1.0, "µV": 0.001, "V": 1000.0}
 
     def __init__(self):
         super().__init__()
@@ -1279,8 +1286,74 @@ class RecordingAnalysisPanel(QWidget):
         amplitude_box.setLayout(amplitude_layout)
         right.addWidget(amplitude_box)
 
+        right.addWidget(self._build_fft_scale_box())
+
         right.addStretch()
         root.addLayout(right, stretch=1)
+
+    def _build_fft_scale_box(self) -> QGroupBox:
+        """Escala del plot de FFT: mismo patrón Automática/Manual que
+        MainWindow._build_scale_box (sidebar "Escala de los plots" de
+        "Monitor"), adaptado a un espectro de amplitud (no negativo): en
+        modo Manual el rango va de 0 a un máximo elegido, en vez de
+        simétrico ±valor como en el plot de tiempo."""
+        box = QGroupBox("Escala del espectro (FFT)")
+        layout = QGridLayout()
+
+        layout.addWidget(QLabel("Modo:"), 0, 0)
+        self.fft_scale_mode_combo = QComboBox()
+        self.fft_scale_mode_combo.addItems(["Automática", "Manual"])
+        self.fft_scale_mode_combo.currentTextChanged.connect(self._on_fft_scale_changed)
+        layout.addWidget(self.fft_scale_mode_combo, 0, 1, 1, 2)
+
+        layout.addWidget(QLabel("Frec. máx (Hz):"), 1, 0)
+        self.fft_x_scale_spin = QDoubleSpinBox()
+        self.fft_x_scale_spin.setRange(1.0, SingleChannelPlot.ASSUMED_SAMPLE_RATE / 2)
+        self.fft_x_scale_spin.setDecimals(1)
+        self.fft_x_scale_spin.setValue(500.0)
+        self.fft_x_scale_spin.valueChanged.connect(self._on_fft_scale_changed)
+        layout.addWidget(self.fft_x_scale_spin, 1, 1, 1, 2)
+
+        layout.addWidget(QLabel("Amplitud máx:"), 2, 0)
+        self.fft_y_scale_spin = QDoubleSpinBox()
+        self.fft_y_scale_spin.setRange(0.001, 10000.0)
+        self.fft_y_scale_spin.setDecimals(3)
+        self.fft_y_scale_spin.setValue(1.0)
+        self.fft_y_scale_spin.valueChanged.connect(self._on_fft_scale_changed)
+        layout.addWidget(self.fft_y_scale_spin, 2, 1)
+
+        self.fft_y_scale_unit_combo = QComboBox()
+        self.fft_y_scale_unit_combo.addItems(list(self._FFT_Y_UNIT_TO_MV.keys()))
+        self.fft_y_scale_unit_combo.currentTextChanged.connect(self._on_fft_scale_changed)
+        layout.addWidget(self.fft_y_scale_unit_combo, 2, 2)
+
+        box.setLayout(layout)
+
+        self._update_fft_scale_controls_enabled()
+        return box
+
+    def _update_fft_scale_controls_enabled(self):
+        manual = self.fft_scale_mode_combo.currentText() == "Manual"
+        for widget in (self.fft_x_scale_spin, self.fft_y_scale_spin, self.fft_y_scale_unit_combo):
+            widget.setEnabled(manual)
+
+    def _on_fft_scale_changed(self, _value=None):
+        """Aplica el modo de escala (automática o manual) del plot de FFT.
+        A diferencia del plot de tiempo (rango simétrico ±y), acá el rango
+        manual va de 0 a un máximo: la amplitud de un espectro nunca es
+        negativa, y 0 Hz es siempre el extremo izquierdo natural del eje de
+        frecuencias."""
+        self._update_fft_scale_controls_enabled()
+
+        auto = self.fft_scale_mode_combo.currentText() == "Automática"
+        self.fft_plot_widget.enableAutoRange(axis="x", enable=auto)
+        self.fft_plot_widget.enableAutoRange(axis="y", enable=auto)
+
+        if not auto:
+            xmax = self.fft_x_scale_spin.value()
+            ymax_mv = self.fft_y_scale_spin.value() * self._FFT_Y_UNIT_TO_MV[self.fft_y_scale_unit_combo.currentText()]
+            self.fft_plot_widget.setXRange(0, xmax, padding=0)
+            self.fft_plot_widget.setYRange(0, ymax_mv, padding=0)
 
     # ---- Carga de archivo ----
 

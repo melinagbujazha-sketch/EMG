@@ -537,6 +537,18 @@ decidió en sesión, sin un plan_*.md dedicado (ver este mismo `CLAUDE.md` para 
     ~A en el espectro. Validado con una señal sintética (tonos de 60 Hz/4 mV y 300 Hz/1 mV + DC de
     1.5 mV): los tres picos aparecen en la frecuencia y amplitud exactas. Con una selección de menos
     de 2 muestras (o vacía) la curva de FFT se limpia en vez de crashear.
+  - Recuadro **"Escala del espectro (FFT)"** (columna derecha, debajo de "Amplitud del rango
+    seleccionado"): mismo patrón Automática/Manual que la sidebar "Escala de los plots" de
+    "Monitor" (`MainWindow._build_scale_box`/`_on_scale_changed`), pero adaptado a un espectro de
+    amplitud — que nunca es negativo — en vez de una señal en el tiempo:
+    - **Automática** (default): autorange de pyqtgraph en ambos ejes, como el resto de los plots.
+    - **Manual**: en vez del rango simétrico `±valor` que usa el plot de tiempo, acá el rango va de
+      **0 a un máximo** elegido — "Frec. máx (Hz)" para el eje X (hasta `fs/2` = 4000 Hz) y
+      "Amplitud máx" + combo de unidad (mV/µV/V, mismos factores que `MainWindow._Y_UNIT_TO_MV`)
+      para el eje Y. `RecordingAnalysisPanel._on_fft_scale_changed()` aplica esto con
+      `setXRange(0, xmax)`/`setYRange(0, ymax_mv)` sobre `fft_plot_widget`, y el rango elegido
+      persiste automáticamente entre redibujados (`_update_fft_plot()` solo llama
+      `fft_curve.setData(...)`, nunca toca el rango de los ejes).
 - **"Avanzado"** (todo lo que antes era la UI principal, sin recortar nada): botones "Buscar
   puertos"/"Auto-detectar CDC"/"Conectar seleccionados"/"Desconectar todo" + spinbox de baudrate +
   tabla de asignación manual de puerto COM por CDC; `CdcPanel` de texto crudo para CDC0/CDC1;
