@@ -4,7 +4,7 @@ Firmware para un sistema de adquisición de señales EMG (electromiografía) mul
 una Raspberry Pi Pico (RP2040) conectada a un ADC frontal analógico ADS1298 (Texas Instruments)
 por SPI, y expuesto a una PC mediante múltiples interfaces USB CDC (TinyUSB). Incluye además una
 GUI en Python (`emg_multicdc_gui.py`) pensada para uso clínico: conexión de un solo botón (sin
-exponer CDC ni puertos COM), sidebar de canales/filtros/RLD-lead-off y grilla de plots en tiempo
+exponer CDC ni puertos COM), sidebar de canales/filtros/RLD y grilla de plots en tiempo
 real, con el detalle de debug (mapeo manual de puertos, texto crudo, configuración granular) en
 una pestaña "Avanzado" aparte.
 
@@ -29,18 +29,25 @@ Implementado:
   paréntesis (p. ej. `"DATA STREAM CH1-CH2 (CDC2)"`), usado también para identificación automática
   de puertos desde la GUI de Python (ver más abajo).
 - GUI clínica en Python (`emg_multicdc_gui.py`, PyQt6 + pyserial + pyqtgraph + numpy + scipy), con
-  4 pestañas: **"Monitor"** (sidebar de canales/ganancia/filtros/RLD-lead-off al 20% + grilla de
+  4 pestañas: **"Monitor"** (sidebar de canales/ganancia/filtros/RLD al 20% + grilla de
   plots en tiempo real al 80%, conexión de un solo botón), **"Señales de prueba"** (test signal
   interna simplificada), **"Análisis"** (carga offline de una grabación CSV previa, plot con
   selección de rango arrastrable y recuadro de amplitud pico a pico, sin necesitar el equipo
   conectado) y **"Avanzado"** (todo el detalle de debug: mapeo manual de puertos por CDC, texto
-  crudo de CDC0/CDC1, estado completo de lead-off/RLD y tabla granular de configuración). Filtros
+  crudo de CDC0/CDC1 y tabla granular de configuración). Filtros
   notch/pasaaltos/pasabajos implementados en software (scipy.signal), no en firmware. Ver sección
-  "Herramienta PC" más abajo para el detalle completo.
-- **Streaming continuo multicore** de los 8 canales EMG + estado de lead-off por USB, y una **API de
-  configuración completa** por CDC1 (ganancia, encendido de canales, modo HR/LP, RLD, test signals,
-  mux de entrada, lead-off detection). Ver sección "Arquitectura de adquisición y streaming" más
-  abajo para el detalle completo.
+  "Herramienta PC" más abajo para el detalle completo. **Nota (sesión 2026-09-06):** se sacó de la
+  GUI toda la función de Lead-off (checkbox "Lead-off activo", cartel "Electrodo desconectado" en
+  cada plot, `RldStatusPanel` de CDC6 y los controles `LOFF_*` de `ConfigPanel`), a pedido del
+  usuario — ver "Herramienta PC" para el detalle de qué quedó. El firmware **no** se tocó: los
+  comandos `LOFF_*`, el bit `CONFIG4.PD_LOFF_COMP` y el streaming de `LOFF_STATP`/`LOFF_STATN` por
+  CDC6 siguen existiendo tal cual (la GUI simplemente ya no los usa ni los muestra); solo queda
+  accesible a mano vía `RREG`/`WREG` crudo desde `CdcPanel` en "Avanzado".
+- **Streaming continuo multicore** de los 8 canales EMG + estado de lead-off por USB (sin usar
+  actualmente por la GUI, ver nota arriba), y una **API de configuración completa** por CDC1
+  (ganancia, encendido de canales, modo HR/LP, RLD, test signals, mux de entrada, lead-off
+  detection). Ver sección "Arquitectura de adquisición y streaming" más abajo para el detalle
+  completo.
 
 Pendiente:
 - Sin pruebas en hardware todavía de la nueva arquitectura de streaming ni del GUI actualizado
@@ -401,7 +408,7 @@ Cada CDC tiene su propio endpoint de notificación, IN y OUT (ver `usb_descripto
 ## Herramienta PC: `emg_multicdc_gui.py`
 
 GUI de escritorio (PyQt6 + pyserial + pyqtgraph + numpy + scipy) pensada para uso clínico:
-conexión de un solo botón, sidebar de canales/filtros/RLD-lead-off y grilla de plots en tiempo
+conexión de un solo botón, sidebar de canales/filtros/RLD y grilla de plots en tiempo
 real, dejando todo el detalle de CDC/puertos/debug en una pestaña "Avanzado" separada.
 Requisitos: `pip install pyqt6 pyserial pyqtgraph numpy scipy`. Uso: `python emg_multicdc_gui.py`.
 El plan de diseño original (streaming binario + panel de configuración) quedó en
@@ -435,25 +442,19 @@ decidió en sesión, sin un plan_*.md dedicado (ver este mismo `CLAUDE.md` para 
       igual aunque los mV cambiaron. Para confirmar que un filtro realmente está actuando, pasar a
       modo Manual con un rango Y fijo antes de activarlo/desactivarlo.
     - **"Filtros (canales visibles)"**: 3 combos — Notch (Apagado/50 Hz/60 Hz), Pasaaltos
-      (Apagado/1 Hz/2 Hz/5 Hz/10 Hz/20 Hz/50 Hz), Pasabajos (Apagado/100 Hz/125 Hz/150 Hz/500 Hz).
+      (Apagado/1 Hz/20 Hz/50 Hz), Pasabajos (Apagado/125 Hz/150 Hz/500 Hz).
       Ver "Filtros de señal" más abajo.
-    - **"RLD / Lead-off"**: dos checkboxes ON/OFF simples, sin nada más. RLD manda primero
+    - **"RLD"**: un único checkbox ON/OFF ("RLD activo"). Manda primero
       `RLD_CH <ch> P/N 1` (ON) o `0` (OFF) para los 8 canales y recién después `RLD ON`/`RLD OFF`
       (`_on_rld_toggle`) — **bug real corregido:** antes solo mandaba `RLD ON/OFF`
       (`CONFIG3.PD_RLD`, que únicamente enciende el amplificador), sin tocar nunca
       `RLD_SENSP`/`RLD_SENSN` (reset = 0x00, ningún canal incluido); el amplificador quedaba
       encendido pero sin ninguna entrada real, así que no hacía rechazo de modo común y no había
-      cambio perceptible al conectar el electrodo de RLD. Lead-off manda `LOFF_CH <ch> P/N 1` (ON) o
-      `0` (OFF) para los 8 canales de una vez, usando los parámetros finos (`LOFF_MODE`/
-      `LOFF_TYPE`/`LOFF_CURRENT`/`LOFF_THRESHOLD`) que estén configurados en "Avanzado" (esa
-      referencia solo vive en este `CLAUDE.md`, no como texto en la sidebar); ver también el bug de
-      firmware corregido en `CONFIG4.PD_LOFF_COMP` (sección "Presupuesto de throughput USB") sin el
-      cual esto nunca funcionaba, sea cual sea la configuración de la GUI — **ese fix requiere
-      reflashear la placa; hasta no hacerlo, el lead-off sigue sin mostrar desconexiones aunque la
-      GUI ya esté corregida.**
-      El aviso de desconexión se muestra ahora en `SingleChannelPlot.set_leadoff()`, como un cartel
-      "Electrodo desconectado" bajo el título de cada canal en el área de plots — ver más abajo
-      ("Cartel de lead-off en cada plot") — no en la sidebar.
+      cambio perceptible al conectar el electrodo de RLD.
+      **Nota (sesión 2026-09-06):** el checkbox "Lead-off activo" que estaba acá al lado (mandaba
+      `LOFF_CH`) se sacó a pedido del usuario, junto con todo lo demás relacionado a Lead-off en la
+      GUI (ver la nota en "Estado actual del proyecto"). El firmware sigue soportando `LOFF_*` sin
+      cambios; solo se puede accionar a mano por `RREG`/`WREG` desde `CdcPanel` en "Avanzado".
   - Área de plots (`MainWindow._rebuild_channel_grid()`): sin scrollbar — siempre se reparte para
     que los canales tildados entren en el espacio disponible, priorizando ver más escala horizontal
     (tiempo) que vertical:
@@ -472,16 +473,12 @@ decidió en sesión, sin un plan_*.md dedicado (ver este mismo `CLAUDE.md` para 
       `QGroupBox`, label de estado, ejes y ticks de pyqtgraph todos a ~9-10px, márgenes/spacing del
       layout interno recortados) para que hasta 4 canales apilados en una misma columna entren sin
       necesitar scroll. `MainWindow.pair_channels` rutea los batches de `poll_process_queues`.
-    - **Cartel de lead-off en cada plot** (`SingleChannelPlot.leadoff_label`, bajo el título "Canal
-      N"): vacío y sin fondo la mayor parte del tiempo; solo cuando `MainWindow._update_leadoff_status`
-      detecta ese canal desconectado (y "Lead-off activo" está tildado) se pinta en rojo con el texto
-      "Electrodo desconectado" (`SingleChannelPlot.set_leadoff()`). **Historial:** antes ahí se
-      mostraba el estado de conexión del CDC de datos ("Conectado a COMx"/"Desconectado",
-      `set_connected()`); se sacó porque confundía con lead-off y era redundante con el label
-      agregado de conexión en la barra superior. También existió brevemente un cartel de lead-off
-      aparte en la sidebar "Canales" (con fondo rojo fijo, visible aunque no hubiera desconexión
-      real) — se sacó por lo mismo y se consolidó acá, en el lugar donde el usuario ya esperaba ver
-      el estado de cada canal.
+      **Historial:** hasta la sesión 2026-09-06 había acá un cartel "Electrodo desconectado"
+      (`SingleChannelPlot.leadoff_label`/`set_leadoff()`) que se pintaba en rojo bajo el título del
+      canal según `LOFF_STATP`/`LOFF_STATN`; se sacó junto con el resto de la función de Lead-off
+      (ver "Estado actual del proyecto"). Antes de eso, en ese mismo lugar se había mostrado el
+      estado de conexión del CDC de datos ("Conectado a COMx"/"Desconectado"), sacado por ser
+      redundante con el label agregado de conexión en la barra superior.
 - **"Señales de prueba"** (`TestSignalPanel`, clase nueva e independiente de `ConfigPanel`): combos
   `TESTSIG`/`TESTSIG_AMP`/`TESTSIG_FREQ` + botones `START`/`STOP`, y un checkbox por canal que manda
   `MUX <ch> TEST` (tildado) o `MUX <ch> NORMAL` (destildado) — versión simplificada del combo
@@ -549,19 +546,26 @@ decidió en sesión, sin un plan_*.md dedicado (ver este mismo `CLAUDE.md` para 
       `setXRange(0, xmax)`/`setYRange(0, ymax_mv)` sobre `fft_plot_widget`, y el rango elegido
       persiste automáticamente entre redibujados (`_update_fft_plot()` solo llama
       `fft_curve.setData(...)`, nunca toca el rango de los ejes).
-- **"Avanzado"** (todo lo que antes era la UI principal, sin recortar nada): botones "Buscar
-  puertos"/"Auto-detectar CDC"/"Conectar seleccionados"/"Desconectar todo" + spinbox de baudrate +
-  tabla de asignación manual de puerto COM por CDC; `CdcPanel` de texto crudo para CDC0/CDC1;
-  `RldStatusPanel` (grilla completa `LOFF_STATP`/`LOFF_STATN` por electrodo); y **`ConfigPanel`**
-  igual que antes (tabla granular por canal — `GAIN`/`CHPOWER`/`MUX`/`LOFF_CH`/`RLD_CH` — más
-  controles globales `MODE`/`RLD`/`TESTSIG*`/`LOFF_MODE`/`LOFF_TYPE`/`LOFF_CURRENT`/
-  `LOFF_THRESHOLD`/`START`/`STOP` y el botón "Releer configuración actual del ADS1298").
+- **"Avanzado"** (todo lo que antes era la UI principal, salvo Lead-off — ver nota abajo): botones
+  "Buscar puertos"/"Auto-detectar CDC"/"Conectar seleccionados"/"Desconectar todo" + spinbox de
+  baudrate + tabla de asignación manual de puerto COM por CDC (sigue listando las 7 interfaces,
+  CDC6 incluido); `CdcPanel` de texto crudo para CDC0/CDC1 (sigue siendo el escape hatch para
+  `RREG`/`WREG` manual sobre cualquier registro, `LOFF` incluido); y **`ConfigPanel`** (tabla
+  granular por canal — `GAIN`/`CHPOWER`/`MUX`/`RLD_CH` — más controles globales
+  `MODE`/`RLD`/`TESTSIG*`/`START`/`STOP` y el botón "Releer configuración actual del ADS1298").
+  **Nota (sesión 2026-09-06):** se sacó `RldStatusPanel` (la grilla `LOFF_STATP`/`LOFF_STATN` por
+  electrodo que vivía acá, junto a `CdcPanel` de CDC0/CDC1) y las columnas/controles `LOFF_CH`,
+  `LOFF_MODE`, `LOFF_TYPE`, `LOFF_CURRENT`, `LOFF_THRESHOLD` de `ConfigPanel`. CDC6 se sigue
+  pudiendo conectar (queda en la tabla de puertos y cuenta para el estado agregado "N/7
+  interfaces"), pero la GUI ya no decodifica ni muestra nada de lo que llega por ahí —
+  `MainWindow.poll_process_queues()` sigue drenando su cola para que no crezca sin límite, y
+  simplemente descarta cada trama.
 
 ### Filtros de señal (software, scipy — no firmware)
 
 Decisión: los filtros se implementan en Python (`scipy.signal`), no en el ADS1298/RP2040. Motivo:
 iteración inmediata sin recompilar/flashear, conserva el código ADC crudo en el buffer de cada
-`SingleChannelPlot`, y no requiere tocar el chip (la ganancia, RLD y lead-off sí son comandos reales
+`SingleChannelPlot`, y no requiere tocar el chip (la ganancia y RLD sí son comandos reales
 de CDC1 que siguen aplicándose en hardware).
 
 - `build_filter_sos(notch_hz, hpf_hz, lpf_hz, fs)`: arma un único array SOS combinando (según qué
@@ -582,7 +586,9 @@ de CDC1 que siguen aplicándose en hardware).
   `self.visible_channels`; `_rebuild_channel_grid()` también llama `set_filter()` sobre los
   canales que pasan a visibles, para que un canal recién tildado ya aparezca filtrado.
 - **Cortes disponibles** (`MainWindow._NOTCH_HZ`/`_HPF_HZ`/`_LPF_HZ`): Notch Apagado/50/60 Hz;
-  Pasaaltos Apagado/1/2/5/10/20/50 Hz; Pasabajos Apagado/100/125/150/500 Hz.
+  Pasaaltos Apagado/1/20/50 Hz; Pasabajos Apagado/125/150/500 Hz. **Nota (sesión 2026-09-06):** se
+  recortó la lista a pedido del usuario — antes Pasaaltos tenía además 2/5/10 Hz y Pasabajos tenía
+  además 100 Hz.
 
 ### Escala de los plots (sidebar "Escala de los plots")
 
@@ -642,7 +648,8 @@ queda como *tooltip* del label (el texto en pantalla es corto, solo "Grabando ca
 Al conectar CDC1 (ya sea vía "Conectar equipo" en "Monitor", "Conectar seleccionados" en
 "Avanzado", o justo después de que el hilo de `SerialWorker` confirme la conexión),
 `MainWindow.read_current_configuration()` manda automáticamente un `RREG` por cada registro
-relevante (`CONFIG_READBACK_REGISTERS`: CONFIG1-3, LOFF, CH1SET..CH8SET, RLD_SENSP/N, LOFF_SENSP/N)
+relevante (`CONFIG_READBACK_REGISTERS`: CONFIG1-3, CH1SET..CH8SET, RLD_SENSP/N — ya no incluye LOFF
+ni LOFF_SENSP/N desde que se sacó Lead-off de la GUI, sesión 2026-09-06)
 para que el `ConfigPanel` de "Avanzado" refleje cómo estaba configurado el chip realmente, en vez de
 asumir los valores por defecto de fábrica. También hay un botón **"Releer configuración actual del
 ADS1298"** en esa pestaña para repetir la lectura a mano (por si se cambió algo por `WREG` crudo o
@@ -651,8 +658,7 @@ se perdió alguna respuesta).
 - Las respuestas ("`REG XX=YY`", formato de `handle_config_command()` en `usb_manager.cpp`) se
   interceptan en `MainWindow.on_data_received()` con la regex `_REG_RESPONSE_RE` y se despachan a
   `ConfigPanel.apply_register(addr, value)`, que decodifica los bits (mismos mapeos que
-  `inc/ads1298.h`: `GAIN_CODE_TO_VALUE`, `MUX_MODES`, `TEST_FREQ_CODE_TO_TEXT`,
-  `LOFF_CURRENT_CODE_TO_TEXT`, `LOFF_MODE_CODE_TO_TEXT`) y actualiza el combo/checkbox
+  `inc/ads1298.h`: `GAIN_CODE_TO_VALUE`, `MUX_MODES`, `TEST_FREQ_CODE_TO_TEXT`) y actualiza el combo/checkbox
   correspondiente con `blockSignals(True)` para **no** volver a mandar el comando al ADS1298 (evita
   un loop de reconfiguración al sincronizar el estado). Para `CH1SET..CH8SET` además emite
   `gain_changed(ch, gain)` (aunque venga de una relectura, no de que el usuario haya tocado el
@@ -844,12 +850,15 @@ COM9→CDC3, COM10→CDC0), confirmando que la detección por banner es necesari
      flasheado — falta esa validación en hardware real.
    - **Pendiente de re-flashear y re-probar (sesión 2026-08-21):** se corrigieron dos bugs reales de
      firmware que impedían usar RLD y lead-off (`CONFIG4.PD_LOFF_COMP` nunca habilitado, y `RLD
-     ON`/`OFF` sin seleccionar canales en `RLD_SENSP`/`N`; ver "Presupuesto de throughput USB" y la
-     sección "RLD / Lead-off" de la GUI). Falta compilar, flashear y validar en la placa real que
-     ahora sí se detecten desconexiones de electrodo y que el RLD reduzca ruido de modo común.
-2. Evaluar si conviene throttlear el envío de CDC6 (RLD/lead-off) a una fracción de la tasa de
-   muestreo, ya que ese estado cambia mucho más lento que la señal EMG y hoy se manda a la misma
-   cadencia que los datos.
+     ON`/`OFF` sin seleccionar canales en `RLD_SENSP`/`N`; ver "Presupuesto de throughput USB").
+     Falta compilar, flashear y validar en la placa real que el RLD reduzca ruido de modo común.
+     **Nota (sesión 2026-09-06):** la GUI ya no tiene una forma dedicada de validar lead-off (se
+     sacó `RldStatusPanel` y el checkbox "Lead-off activo"); para probar la detección de electrodo
+     desconectado a nivel firmware hay que usar `LOFF_CH`/`RREG LOFF_STATP`/`RREG LOFF_STATN` a
+     mano desde `CdcPanel` de CDC1 en "Avanzado".
+2. Evaluar si conviene throttlear el envío de CDC6 (lead-off status, sin usar actualmente por la
+   GUI) a una fracción de la tasa de muestreo, ya que ese estado cambia mucho más lento que la
+   señal EMG y hoy se manda a la misma cadencia que los datos.
 3. ~~Conversión a mV en `SingleChannelPlot`~~ — hecho (`code_to_millivolts()`, ver sección
    "Conversión código ADC → mV"). Sigue pendiente: si se agrega un comando para cambiar `VREF_4V` a
    la API de CDC1, hay que actualizar `ADS1298_VREF_VOLTS` o trackearlo igual que la ganancia.

@@ -24,9 +24,8 @@ Auto-detección de puertos COM:
 
 Streaming binario (CDC2-6) y arquitectura multicore:
     El firmware manda datos binarios continuos por CDC2-5 (2 canales EMG de
-    24 bits cada uno, trama de 7 bytes: 1 byte de sync 0xAA + 3+3 bytes) y
-    por CDC6 (lead-off status, trama de 3 bytes: sync + LOFF_STATP +
-    LOFF_STATN). Ver CLAUDE.md para el detalle completo del protocolo.
+    24 bits cada uno, trama de 7 bytes: 1 byte de sync 0xAA + 3+3 bytes). Ver
+    CLAUDE.md para el detalle completo del protocolo.
 
     CDC0 (debug) y CDC1 (config) siguen siendo texto por línea y usan
     QThread + SerialWorker como antes. CDC2-6, en cambio, corren cada uno en
@@ -44,7 +43,7 @@ Interfaz clínica (3 pestañas):
 
     "Monitor" es la pestaña principal: una sidebar a la izquierda (~20% del
     ancho, selección de canales visibles + ganancia por canal, escala de
-    los plots, filtros de software y toggles simples de RLD/lead-off) y a
+    los plots, filtros de software y toggle simple de RLD) y a
     la derecha el área de plots de los canales tildados, ocupando el 80%
     restante del espacio **sin scrollbar** (siempre se reparten para entrar
     en el espacio disponible, ver MainWindow._rebuild_channel_grid): con
@@ -66,18 +65,17 @@ Interfaz clínica (3 pestañas):
 
     "Avanzado" concentra todo lo que antes era la UI de debug, sin recortar
     funcionalidad: mapeo manual de puertos por CDC, paneles de texto crudo de
-    CDC0/CDC1 (incluyendo RREG/WREG a mano), el estado completo de
-    lead-off/RLD por electrodo, y la tabla granular de configuración por
-    canal (ganancia, encendido, mux, lead-off y RLD por P/N).
+    CDC0/CDC1 (incluyendo RREG/WREG a mano), y la tabla granular de
+    configuración por canal (ganancia, encendido, mux y RLD por P/N).
 
 Filtros de señal (software, no firmware):
-    Notch (50/60 Hz), pasaaltos (20/50 Hz) y pasabajos (150/500 Hz) se
+    Notch (50/60 Hz), pasaaltos (1/20/50 Hz) y pasabajos (125/150/500 Hz) se
     implementan en Python con scipy.signal (Butterworth + notch IIR,
     combinados en un único array SOS por build_filter_sos()) y se aplican en
     SingleChannelPlot.refresh() con sosfiltfilt (fase cero) sobre la ventana
     visible completa en cada redibujado, solo a los canales actualmente
-    visibles. No requieren tocar el firmware ni el ADS1298; la ganancia, RLD
-    y lead-off sí son comandos reales de CDC1 y siguen aplicándose en el chip.
+    visibles. No requieren tocar el firmware ni el ADS1298; la ganancia y RLD
+    sí son comandos reales de CDC1 y siguen aplicándose en el chip.
 
 Escala de los plots:
     Cada SingleChannelPlot autoescala ambos ejes por defecto (pyqtgraph
@@ -154,12 +152,12 @@ _REG_RESPONSE_RE = re.compile(r"^REG\s+([0-9A-Fa-f]{2})=([0-9A-Fa-f]{2})$")
 
 # Registros que se leen automáticamente al conectar CDC1, para reflejar en la
 # pestaña de Configuración cómo está configurado realmente el ADS1298 (en vez
-# de asumir los valores por defecto). CONFIG1..LOFF, CH1SET..CH8SET,
-# RLD_SENSP/N, LOFF_SENSP/N (ver inc/ads1298.h para las direcciones).
+# de asumir los valores por defecto). CONFIG1..CONFIG3, CH1SET..CH8SET,
+# RLD_SENSP/N (ver inc/ads1298.h para las direcciones).
 CONFIG_READBACK_REGISTERS = [
-    0x01, 0x02, 0x03, 0x04,
+    0x01, 0x02, 0x03,
     0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
-    0x0D, 0x0E, 0x0F, 0x10,
+    0x0D, 0x0E,
 ]
 
 
@@ -595,16 +593,6 @@ class SingleChannelPlot(QGroupBox):
         self.setMinimumWidth(150)
         self.setStyleSheet("QGroupBox { font-size: 10px; margin-top: 4px; }")
 
-        # Cartel de lead-off (ver set_leadoff/MainWindow._update_leadoff_status):
-        # vacío y sin fondo la mayor parte del tiempo, solo se pinta cuando
-        # ese canal está realmente desconectado. Antes acá se mostraba el
-        # estado de conexión del CDC de datos ("Conectado a COMx"/
-        # "Desconectado"), quitado porque no aportaba nada que no estuviera
-        # ya en el label agregado de la barra superior y confundía con el
-        # aviso de lead-off.
-        self.leadoff_label = QLabel("")
-        self.leadoff_label.setStyleSheet("font-size: 9px;")
-
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.setBackground("k")
         self.plot_widget.showGrid(x=True, y=True, alpha=0.3)
@@ -629,24 +617,8 @@ class SingleChannelPlot(QGroupBox):
         layout = QVBoxLayout()
         layout.setContentsMargins(4, 2, 4, 4)
         layout.setSpacing(2)
-        layout.addWidget(self.leadoff_label)
         layout.addWidget(self.plot_widget)
         self.setLayout(layout)
-
-    def set_leadoff(self, disconnected: bool):
-        """Cartel "Electrodo desconectado" bajo el título del canal (ver
-        MainWindow._update_leadoff_status, que lo llama con el bit de
-        LOFF_STATP/LOFF_STATN de este canal). Solo tiene efecto visible
-        mientras "Lead-off activo" está tildado en la sidebar; en cualquier
-        otro momento se llama con disconnected=False y queda vacío."""
-        if disconnected:
-            self.leadoff_label.setText("Electrodo desconectado")
-            self.leadoff_label.setStyleSheet(
-                "color: white; background-color: #b00020; font-weight: bold; font-size: 9px;"
-            )
-        else:
-            self.leadoff_label.setText("")
-            self.leadoff_label.setStyleSheet("font-size: 9px;")
 
     def set_gain(self, gain: int):
         """Actualiza la ganancia usada para convertir a mV (llamado desde
@@ -736,74 +708,6 @@ class SingleChannelPlot(QGroupBox):
 
 
 # ==================================================
-# CDC6: estado de RLD / lead-off
-# ==================================================
-
-
-class RldStatusPanel(QGroupBox):
-    """Panel de estado de lead-off (LOFF_STATP/LOFF_STATN) para CDC6.
-    Un bit en 1 significa "electrodo desconectado" (ver datasheet ADS1298,
-    registros LOFF_STATP/LOFF_STATN)."""
-
-    def __init__(self, name: str):
-        super().__init__(name)
-        self.name = name
-        self.setMinimumHeight(160)
-
-        self.status = QLabel("Desconectado")
-        self.status.setStyleSheet("color: red; font-weight: bold;")
-
-        self.statp_labels = []
-        self.statn_labels = []
-
-        grid = QGridLayout()
-        grid.addWidget(QLabel("<b>Canal</b>"), 0, 0)
-        for ch in range(8):
-            grid.addWidget(QLabel(str(ch + 1)), 0, ch + 1)
-
-        grid.addWidget(QLabel("<b>LOFF_STATP</b>"), 1, 0)
-        for ch in range(8):
-            lbl = QLabel("-")
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet("background-color: #333; color: white; font-weight: bold;")
-            grid.addWidget(lbl, 1, ch + 1)
-            self.statp_labels.append(lbl)
-
-        grid.addWidget(QLabel("<b>LOFF_STATN</b>"), 2, 0)
-        for ch in range(8):
-            lbl = QLabel("-")
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet("background-color: #333; color: white; font-weight: bold;")
-            grid.addWidget(lbl, 2, ch + 1)
-            self.statn_labels.append(lbl)
-
-        layout = QVBoxLayout()
-        layout.addWidget(self.status)
-        layout.addLayout(grid)
-        layout.addStretch()
-        self.setLayout(layout)
-
-    def set_connected(self, connected: bool, msg: str):
-        self.status.setText(msg)
-        color = "green" if connected else "red"
-        self.status.setStyleSheet(f"color: {color}; font-weight: bold;")
-
-    def update_status(self, statp: int, statn: int):
-        for ch in range(8):
-            self._set_bit(self.statp_labels[ch], (statp >> ch) & 1)
-            self._set_bit(self.statn_labels[ch], (statn >> ch) & 1)
-
-    @staticmethod
-    def _set_bit(label: QLabel, bit: int):
-        if bit:
-            label.setText("OFF")
-            label.setStyleSheet("background-color: #b00020; color: white; font-weight: bold;")
-        else:
-            label.setText("OK")
-            label.setStyleSheet("background-color: #1b5e20; color: white; font-weight: bold;")
-
-
-# ==================================================
 # Pestaña de configuración (comandos de CDC1)
 # ==================================================
 
@@ -814,8 +718,6 @@ MUX_MODES = ["NORMAL", "SHORT", "RLD_MEAS", "SUPPLY", "TEMP", "TEST", "RLD_DRP",
 # exactamente con ads1298::gainToCode() y los bits de inc/ads1298.h).
 GAIN_CODE_TO_VALUE = {0: 6, 1: 1, 2: 2, 3: 3, 4: 4, 5: 8, 6: 12}
 TEST_FREQ_CODE_TO_TEXT = {0x00: "SLOW", 0x01: "FAST", 0x03: "DC"}
-LOFF_CURRENT_CODE_TO_TEXT = {0x00: "6", 0x01: "12", 0x02: "18", 0x03: "24"}
-LOFF_MODE_CODE_TO_TEXT = {0x03: "DC", 0x01: "AC"}
 
 
 class ConfigPanel(QWidget):
@@ -838,8 +740,6 @@ class ConfigPanel(QWidget):
         self.gain_combos = {}
         self.power_checks = {}
         self.mux_combos = {}
-        self.loffp_checks = {}
-        self.loffn_checks = {}
         self.rldp_checks = {}
         self.rldn_checks = {}
 
@@ -848,10 +748,6 @@ class ConfigPanel(QWidget):
         self.testsig_combo = None
         self.amp_combo = None
         self.freq_combo = None
-        self.loff_mode_combo = None
-        self.loff_type_combo = None
-        self.loff_current_combo = None
-        self.loff_threshold_combo = None
 
         layout = QVBoxLayout()
         layout.addWidget(self._build_channel_table())
@@ -875,7 +771,7 @@ class ConfigPanel(QWidget):
         box = QGroupBox("Configuración por canal")
         grid = QGridLayout()
 
-        headers = ["Canal", "Ganancia", "Encendido", "Mux", "LOFF P", "LOFF N", "RLD P", "RLD N"]
+        headers = ["Canal", "Ganancia", "Encendido", "Mux", "RLD P", "RLD N"]
         for col, text in enumerate(headers):
             grid.addWidget(QLabel(f"<b>{text}</b>"), 0, col)
 
@@ -908,32 +804,18 @@ class ConfigPanel(QWidget):
             grid.addWidget(mux_combo, row, 3)
             self.mux_combos[ch] = mux_combo
 
-            loffp_check = QCheckBox()
-            loffp_check.toggled.connect(
-                lambda checked, c=ch: self._send(f"LOFF_CH {c} P {1 if checked else 0}")
-            )
-            grid.addWidget(loffp_check, row, 4)
-            self.loffp_checks[ch] = loffp_check
-
-            loffn_check = QCheckBox()
-            loffn_check.toggled.connect(
-                lambda checked, c=ch: self._send(f"LOFF_CH {c} N {1 if checked else 0}")
-            )
-            grid.addWidget(loffn_check, row, 5)
-            self.loffn_checks[ch] = loffn_check
-
             rldp_check = QCheckBox()
             rldp_check.toggled.connect(
                 lambda checked, c=ch: self._send(f"RLD_CH {c} P {1 if checked else 0}")
             )
-            grid.addWidget(rldp_check, row, 6)
+            grid.addWidget(rldp_check, row, 4)
             self.rldp_checks[ch] = rldp_check
 
             rldn_check = QCheckBox()
             rldn_check.toggled.connect(
                 lambda checked, c=ch: self._send(f"RLD_CH {c} N {1 if checked else 0}")
             )
-            grid.addWidget(rldn_check, row, 7)
+            grid.addWidget(rldn_check, row, 5)
             self.rldn_checks[ch] = rldn_check
 
         box.setLayout(grid)
@@ -973,37 +855,13 @@ class ConfigPanel(QWidget):
         self.freq_combo.currentTextChanged.connect(lambda v: self._send(f"TESTSIG_FREQ {v}"))
         layout.addWidget(self.freq_combo, 1, 5)
 
-        layout.addWidget(QLabel("Lead-off modo:"), 2, 0)
-        self.loff_mode_combo = QComboBox()
-        self.loff_mode_combo.addItems(["DC", "AC"])
-        self.loff_mode_combo.currentTextChanged.connect(lambda v: self._send(f"LOFF_MODE {v}"))
-        layout.addWidget(self.loff_mode_combo, 2, 1)
-
-        layout.addWidget(QLabel("Lead-off tipo:"), 2, 2)
-        self.loff_type_combo = QComboBox()
-        self.loff_type_combo.addItems(["RESISTOR", "CURRENT"])
-        self.loff_type_combo.currentTextChanged.connect(lambda v: self._send(f"LOFF_TYPE {v}"))
-        layout.addWidget(self.loff_type_combo, 2, 3)
-
-        layout.addWidget(QLabel("Lead-off corriente (nA):"), 3, 0)
-        self.loff_current_combo = QComboBox()
-        self.loff_current_combo.addItems(["6", "12", "18", "24"])
-        self.loff_current_combo.currentTextChanged.connect(lambda v: self._send(f"LOFF_CURRENT {v}"))
-        layout.addWidget(self.loff_current_combo, 3, 1)
-
-        layout.addWidget(QLabel("Lead-off umbral (0-7):"), 3, 2)
-        self.loff_threshold_combo = QComboBox()
-        self.loff_threshold_combo.addItems([str(i) for i in range(8)])
-        self.loff_threshold_combo.currentTextChanged.connect(lambda v: self._send(f"LOFF_THRESHOLD {v}"))
-        layout.addWidget(self.loff_threshold_combo, 3, 3)
-
         start_button = QPushButton("START")
         start_button.clicked.connect(lambda: self._send("START"))
-        layout.addWidget(start_button, 4, 0)
+        layout.addWidget(start_button, 2, 0)
 
         stop_button = QPushButton("STOP")
         stop_button.clicked.connect(lambda: self._send("STOP"))
-        layout.addWidget(stop_button, 4, 1)
+        layout.addWidget(stop_button, 2, 1)
 
         box.setLayout(layout)
         return box
@@ -1022,13 +880,6 @@ class ConfigPanel(QWidget):
             self._set_combo_silently(self.freq_combo, TEST_FREQ_CODE_TO_TEXT.get(value & 0x03))
         elif addr == 0x03:  # CONFIG3
             self._set_combo_silently(self.rld_combo, "ON" if value & 0x04 else "OFF")
-        elif addr == 0x04:  # LOFF
-            self._set_combo_silently(self.loff_threshold_combo, str((value & 0xE0) >> 5))
-            self._set_combo_silently(self.loff_type_combo, "RESISTOR" if value & 0x10 else "CURRENT")
-            self._set_combo_silently(
-                self.loff_current_combo, LOFF_CURRENT_CODE_TO_TEXT.get((value & 0x0C) >> 2)
-            )
-            self._set_combo_silently(self.loff_mode_combo, LOFF_MODE_CODE_TO_TEXT.get(value & 0x03))
         elif 0x05 <= addr <= 0x0C:  # CH1SET..CH8SET
             ch = addr - 0x05 + 1
             gain_text = GAIN_CODE_TO_VALUE.get((value & 0x70) >> 4)
@@ -1046,10 +897,6 @@ class ConfigPanel(QWidget):
             self._apply_channel_bits(value, self.rldp_checks)
         elif addr == 0x0E:  # RLD_SENSN
             self._apply_channel_bits(value, self.rldn_checks)
-        elif addr == 0x0F:  # LOFF_SENSP
-            self._apply_channel_bits(value, self.loffp_checks)
-        elif addr == 0x10:  # LOFF_SENSN
-            self._apply_channel_bits(value, self.loffn_checks)
 
     @staticmethod
     def _apply_channel_bits(value: int, checks: dict):
@@ -1541,8 +1388,8 @@ class ProcessConnection:
 class MainWindow(QMainWindow):
     # Combos de la sidebar de filtros -> parámetro de build_filter_sos().
     _NOTCH_HZ = {"Apagado": None, "50 Hz": 50, "60 Hz": 60}
-    _HPF_HZ = {"Apagado": None, "1 Hz": 1, "2 Hz": 2, "5 Hz": 5, "10 Hz": 10, "20 Hz": 20, "50 Hz": 50}
-    _LPF_HZ = {"Apagado": None, "100 Hz": 100, "125 Hz": 125, "150 Hz": 150, "500 Hz": 500}
+    _HPF_HZ = {"Apagado": None, "1 Hz": 1, "20 Hz": 20, "50 Hz": 50}
+    _LPF_HZ = {"Apagado": None, "125 Hz": 125, "150 Hz": 150, "500 Hz": 500}
 
     # Combos de unidad de la sidebar "Escala de los plots" -> factor de
     # conversión a las unidades internas (segundos / mV).
@@ -1560,7 +1407,6 @@ class MainWindow(QMainWindow):
         self.channel_checks = {}  # QCheckBox "canal visible" (1-8), en la sidebar
         self.channel_gain_combos = {}  # QComboBox de ganancia por canal, en la sidebar
         self.visible_channels = []
-        self.rld_panel = None     # RldStatusPanel para CDC6, en "Avanzado"
         self.connections = {}     # name -> ThreadConnection | ProcessConnection
         self.port_combos = {}
         self.current_filter_sos = None  # sos vigente, aplicado a los canales visibles
@@ -1653,7 +1499,7 @@ class MainWindow(QMainWindow):
 
     def _build_monitor_tab(self) -> QWidget:
         """Pestaña principal: sidebar (~20% del ancho) con selección de
-        canales/ganancia, filtros y RLD/lead-off, más el área de plots de
+        canales/ganancia, filtros y RLD, más el área de plots de
         los canales visibles ocupando el 80% restante (ver QSplitter), sin
         scrollbar: siempre se reparten para entrar en el espacio disponible
         (ver _rebuild_channel_grid)."""
@@ -1696,7 +1542,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._build_channel_box())
         layout.addWidget(self._build_scale_box())
         layout.addWidget(self._build_filter_box())
-        layout.addWidget(self._build_rld_leadoff_box())
+        layout.addWidget(self._build_rld_box())
         layout.addStretch()
 
         return sidebar
@@ -1797,17 +1643,13 @@ class MainWindow(QMainWindow):
         box.setLayout(layout)
         return box
 
-    def _build_rld_leadoff_box(self) -> QGroupBox:
-        box = QGroupBox("RLD / Lead-off")
+    def _build_rld_box(self) -> QGroupBox:
+        box = QGroupBox("RLD")
         layout = QVBoxLayout()
 
         self.rld_toggle = QCheckBox("RLD activo")
         self.rld_toggle.toggled.connect(self._on_rld_toggle)
         layout.addWidget(self.rld_toggle)
-
-        self.leadoff_toggle = QCheckBox("Lead-off activo")
-        self.leadoff_toggle.toggled.connect(self._on_leadoff_toggle)
-        layout.addWidget(self.leadoff_toggle)
 
         box.setLayout(layout)
         return box
@@ -1830,9 +1672,9 @@ class MainWindow(QMainWindow):
 
     def _build_advanced_tab(self) -> QWidget:
         """Todo lo que antes era la UI principal de debug: mapeo manual de
-        puertos por CDC, paneles de texto crudo, estado detallado de
-        lead-off/RLD y la tabla granular de configuración por canal. Nada de
-        esto se recorta — solo se relocaliza acá."""
+        puertos por CDC, paneles de texto crudo y la tabla granular de
+        configuración por canal. Nada de esto se recorta — solo se
+        relocaliza acá."""
         advanced = QWidget()
         layout = QVBoxLayout()
         advanced.setLayout(layout)
@@ -1879,8 +1721,6 @@ class MainWindow(QMainWindow):
             self.panels[name] = widget
             top_row.addWidget(widget)
 
-        self.rld_panel = RldStatusPanel(CDC_NAMES[6])
-        top_row.addWidget(self.rld_panel)
         layout.addLayout(top_row)
 
         self.config_panel = ConfigPanel()
@@ -1901,7 +1741,7 @@ class MainWindow(QMainWindow):
         scroll.setWidget(advanced)
         return scroll
 
-    # ---- Filtros, escala, ganancia y RLD/lead-off desde la sidebar ----
+    # ---- Filtros, escala, ganancia y RLD desde la sidebar ----
 
     def _on_filter_changed(self, _value=None):
         notch = self._NOTCH_HZ[self.notch_combo.currentText()]
@@ -1957,29 +1797,6 @@ class MainWindow(QMainWindow):
             self.send_config_command(f"RLD_CH {ch} P {value}")
             self.send_config_command(f"RLD_CH {ch} N {value}")
         self.send_config_command(f"RLD {'ON' if checked else 'OFF'}")
-
-    def _on_leadoff_toggle(self, checked: bool):
-        value = 1 if checked else 0
-        for ch in range(1, 9):
-            self.send_config_command(f"LOFF_CH {ch} P {value}")
-            self.send_config_command(f"LOFF_CH {ch} N {value}")
-        if not checked:
-            for plot in self.channel_plots.values():
-                plot.set_leadoff(False)
-
-    def _update_leadoff_status(self, statp: int, statn: int):
-        """Muestra "Electrodo desconectado" bajo el título de cada
-        SingleChannelPlot cuando LOFF_STATP/LOFF_STATN marca ese canal como
-        desconectado (ver RldStatusPanel.update_status para el mismo mapeo
-        de bits, en "Avanzado"). Solo tiene sentido mientras "Lead-off
-        activo" está tildado: si no, los comparadores no están habilitados
-        para esos canales y los bits no reflejan nada real."""
-        if not self.leadoff_toggle.isChecked():
-            return
-        for ch in range(1, 9):
-            bit = ch - 1
-            disconnected = bool((statp >> bit) & 1) or bool((statn >> bit) & 1)
-            self.channel_plots[ch].set_leadoff(disconnected)
 
     # ---- Grabación a CSV ----
 
@@ -2362,13 +2179,6 @@ class MainWindow(QMainWindow):
                         self.channel_plots[channel_b].append_batch(values_b)
                         self._record_batch(channel_a, values_a)
                         self._record_batch(channel_b, values_b)
-                elif tag == "rld":
-                    _, values_a, values_b = msg
-                    if len(values_a) and len(values_b):
-                        statp, statn = int(values_a[-1]), int(values_b[-1])
-                        if self.rld_panel is not None:
-                            self.rld_panel.update_status(statp, statn)
-                        self._update_leadoff_status(statp, statn)
 
     def refresh_plots(self):
         # Solo redibuja los canales que están visibles: los ocultos siguen
@@ -2449,18 +2259,12 @@ class MainWindow(QMainWindow):
             self.showFullScreen()
 
     def _update_connection_status(self, name: str, connected: bool, text: str):
-        # Los CDC de datos (CDC2-5) ya no reflejan su estado de conexión en
-        # cada SingleChannelPlot (ver set_leadoff): ese lugar ahora se usa
-        # para el aviso de lead-off, y el estado agregado de conexión ya se
-        # ve en el label de la barra superior ("Equipo desconectado"/verde/
-        # ámbar/rojo).
+        # Los CDC de datos (CDC2-6) no reflejan su estado de conexión en
+        # ningún panel propio: el estado agregado de conexión ya se ve en el
+        # label de la barra superior ("Equipo desconectado"/verde/ámbar/rojo).
         panel = self.panels.get(name)
         if panel:
             panel.set_connected(connected, text)
-            return
-
-        if self.rld_panel is not None and name == self.rld_panel.name:
-            self.rld_panel.set_connected(connected, text)
 
     @pyqtSlot(str, str)
     def on_data_received(self, name: str, text: str):
