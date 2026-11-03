@@ -465,9 +465,23 @@ decidió en sesión, sin un plan_*.md dedicado (ver este mismo `CLAUDE.md` para 
       5 canales -> 3 y 2; 7 canales -> 4 y 3; 8 canales -> 4 y 4), cada columna con su propio
       `QVBoxLayout` interno repartiendo la altura por igual entre sus canales.
     - Los contenedores "columna" (`QWidget` con `QVBoxLayout`) son transitorios y se recrean
-      enteros en cada llamada; los `SingleChannelPlot` en cambio son permanentes — se re-parentan a
-      la columna nueva (`addWidget` los reparenta automáticamente) antes de que Qt destruya
-      efectivamente la columna vieja (`deleteLater()` corre recién en el próximo ciclo de eventos).
+      enteros en cada llamada; los `SingleChannelPlot` en cambio son permanentes — los que quedan
+      visibles se re-parentan a la columna nueva (`addWidget` los reparenta automáticamente) antes
+      de que Qt destruya efectivamente la columna vieja (`deleteLater()` corre recién en el próximo
+      ciclo de eventos). **Bug real corregido (sesión 2026-09-06):** los canales que quedaban
+      *ocultos* en una llamada no se tocaban en absoluto, así que seguían siendo hijos Qt de la
+      columna vieja — cuando esa columna se destruía en cascada (`deleteLater()`), el
+      `SingleChannelPlot` oculto se destruía con ella aunque `self.channel_plots` en Python lo
+      siguiera referenciando. Al re-tildar ese canal más tarde, `_rebuild_channel_grid()` intentaba
+      reusar un `QWidget` ya borrado por Qt (`RuntimeError: wrapped C/C++ object ... has been
+      deleted`), lo que dejaba la grilla vacía y la ventana trabada (síntoma reportado: "al
+      destildar canales hasta dejar solo 1 anda perfecto, pero al volver a tildar alguno
+      desaparecen todos y se traba"). Fix: al principio de `_rebuild_channel_grid()`, `setParent(None)`
+      en los 8 `SingleChannelPlot` (visibles y ocultos) antes de vaciar/destruir las columnas
+      viejas, para que ningún plot quede como hijo de un contenedor que está por desaparecer.
+      Confirmado con un script que reproduce la secuencia completa dentro de un loop `QApplication`
+      real (`deleteLater()` solo cascadea children al volver al event loop de nivel superior, así
+      que hay que probarlo con `app.exec()`, no alcanza con `processEvents()` anidado).
     - `SingleChannelPlot`: eje Y en mV y eje X en **segundos**, ambos con autoescala por defecto (o
       rango fijo en modo manual, ver más abajo); tipografía/interlineado reducidos (título del
       `QGroupBox`, label de estado, ejes y ticks de pyqtgraph todos a ~9-10px, márgenes/spacing del

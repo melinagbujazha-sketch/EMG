@@ -2200,11 +2200,23 @@ class MainWindow(QMainWindow):
           floor(n/2) (p. ej. 5 canales -> 3 y 2; 7 canales -> 4 y 3).
 
         Los QWidget "columna" son contenedores transitorios que se recrean
-        en cada llamada; los SingleChannelPlot en cambio son permanentes y
-        se re-parentan a la columna nueva (vía addWidget) antes de que Qt
-        efectivamente destruya la columna vieja (deleteLater() se ejecuta
-        recién en el próximo ciclo de eventos, así que el reparenting ya
-        ocurrió para entonces)."""
+        en cada llamada; los SingleChannelPlot en cambio son permanentes.
+        Los que quedan visibles se re-parentan a la columna nueva (vía
+        addWidget) antes de que Qt efectivamente destruya la columna vieja
+        (deleteLater() se ejecuta recién en el próximo ciclo de eventos, así
+        que el reparenting ya ocurrió para entonces). Los que quedan
+        ocultos, en cambio, NO se tocan en el resto de la función — por eso
+        primero hay que desprenderlos a todos de la columna vieja
+        (setParent(None)) antes de mandarla a deleteLater(): si no, un
+        canal que sigue oculto en esta llamada quedaría como hijo de la
+        columna vieja, y deleteLater() la destruiría en cascada junto con
+        el SingleChannelPlot (bug real: al volver a tildar un canal
+        destildado, MainWindow intentaba reusar un QWidget ya borrado por
+        Qt -> "wrapped C/C++ object... has been deleted", la grilla quedaba
+        vacía y la ventana se trababa)."""
+        for plot in self.channel_plots.values():
+            plot.setParent(None)
+
         while self.channel_grid.count():
             item = self.channel_grid.takeAt(0)
             widget = item.widget()
