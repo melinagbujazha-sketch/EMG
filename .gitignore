@@ -1,2 +1,4 @@
 build
 !.vscode/*
+/dist
+emg_multicdc_gui.spec
